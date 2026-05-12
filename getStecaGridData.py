@@ -55,6 +55,7 @@ _M_REQ16 = [
     0x0000, 0x0000, 0xc870, 0x25bd, 0x4b7a, 0x96f4, 0x98b5, 0x8437,
 ]
 _OFF_40 = 0x572c
+_OFF_68 = 0xeef5  # verified: 3/3 captured frames (topics 0x09, 0x5a, 0x5b)
 _OFF_7b = 0xb1e5
 
 def calc_crc2_ping(to_id: int, sem_id: int = SEM_ID) -> int:
@@ -72,7 +73,8 @@ def calc_crc2_req16(topic: int, cmd: int, sem_id: int = SEM_ID) -> int:
     for bit in range(8):
         if ((topic ^ _T_REF) >> bit) & 1: crc2 ^= _M_REQ16[bit]
         if ((chk ^ chk_ref) >> bit) & 1:  crc2 ^= _M_REQ16[8 + bit]
-    if cmd == 0x40:      crc2 ^= _OFF_40
+    if cmd == 0x40: crc2 ^= _OFF_40
+    if cmd == 0x68: crc2 ^= _OFF_68
     if   sem_id == 0x7b: crc2 ^= _OFF_7b
     elif sem_id != 0xc9: raise ValueError(f"unsupported SEM ID 0x{sem_id:02x}")
     return crc2
@@ -88,12 +90,10 @@ def build_ping(to_id: int, sem_id: int = SEM_ID) -> bytes:
 def build_request16(to_id: int, topic: int, cmd: int,
                     sem_id: int = SEM_ID) -> bytes:
     """16-byte data-request frame.
-    CRC2 is solved for cmd=0x40 (RequestA) and cmd=0x64 (RequestB).
-    For cmd=0x68 (RequestC / event log) CRC2 is not yet modelled — sent
-    as 0x0000; the inverter may or may not enforce it."""
+    CRC2 solved for cmd=0x40 (RequestA), 0x64 (RequestB), 0x68 (RequestC)."""
     h    = bytes([0x02, 0x01, 0x00, 0x10, to_id, sem_id])
     crc1 = calc_crc1(h)
-    crc2 = calc_crc2_req16(topic, cmd, sem_id) if cmd in (0x40, 0x64) else 0x0000
+    crc2 = calc_crc2_req16(topic, cmd, sem_id) if cmd in (0x40, 0x64, 0x68) else 0x0000
     chk  = (topic + 0x55) & 0xFF
     return h + bytes([crc1, cmd, 0x03, 0x00, 0x01, topic, chk,
                       crc2 >> 8, crc2 & 0xFF, 0x03])
@@ -107,8 +107,8 @@ SG_PANEL_CURRENT = build_request16(0x01, 0x24, 0x40)
 SG_AC_POWER      = build_request16(0x01, 0x29, 0x40)
 SG_DAILY_YIELD   = build_request16(0x01, 0x3c, 0x40)
 SG_GRID_MEAS      = build_request16(0x01, 0x51, 0x40)
-SG_EVENT_LOG_P1   = build_request16(0x01, 0x5a, 0x68)  # CRC2 experimental
-SG_EVENT_LOG_P2   = build_request16(0x01, 0x5b, 0x68)  # CRC2 experimental
+SG_EVENT_LOG_P1   = build_request16(0x01, 0x5a, 0x68)
+SG_EVENT_LOG_P2   = build_request16(0x01, 0x5b, 0x68)
 SG_TIME           = build_request16(0x01, 0x05, 0x64)
 SG_MYSTERY_ONE   = build_request16(0x01, 0x08, 0x64)
 SG_SERIAL        = build_request16(0x01, 0x09, 0x64)
@@ -492,7 +492,7 @@ if __name__ == "__main__":
             req   = build_request16(inv_id, topic, 0x68)
             value = getStecaGridResult(port, req, timeout_s=3.0)
             if value is None:
-                print(f"EventLog-{page}: no response (CRC2 for cmd=0x68 not yet solved)")
+                print(f"EventLog-{page}: no response")
                 continue
             if isinstance(value, tuple):
                 total_ev, events = value

@@ -37,11 +37,13 @@ LEN = total frame length including STX (0x02) and ETX (0x03)
 | Request  | `0x54` | Request type D |
 | Request  | `0x60` | Request type E |
 | Request  | `0x64` | Request type B (yield, time, serial) |
+| Request  | `0x34` | Unknown (seen before event log; CRC2 not yet modelled) |
 | Request  | `0x68` | Request type C (event log, serial detail) |
 | Response | `0x41` | Response type A |
 | Response | `0x55` | Response type D |
 | Response | `0x61` | Response type E |
 | Response | `0x65` | Response type B |
+| Response | `0x35` | Unknown response to 0x34 |
 | Response | `0x69` | Response type C |
 | Response | `0x21` | Versions response |
 
@@ -154,6 +156,18 @@ def calc_crc2_request16(topic: int, cmd: int = 0x64,
     return crc2
 ```
 Verified: **68/68 topics correct** for cmd=`0x64`; **9/9 correct** for cmd=`0x40`.
+
+#### Event log / serial detail requests (cmd=`0x68`)
+
+Same model as above, with an additional offset:
+
+```python
+OFFSET_68 = 0xeef5   # XOR for cmd=0x68 vs cmd=0x64
+```
+
+Add `if cmd == 0x68: crc2 ^= OFFSET_68` in `calc_crc2_request16`.
+
+Verified: **3/3 captured frames correct** (topics `0x09`, `0x5a`, `0x5b`, SEM=`0xc9`).
 
 ---
 
@@ -299,7 +313,7 @@ HMI / PU / ENS2 — Net11
 ---
 
 ## Open Topics
-- **CRC2 for cmd=`0x68`** frames (event log requests, serial detail): not yet modelled — too few data points. Captured frames can be replayed as-is.
+- **cmd=`0x34`/`0x35`** (12-byte frames seen immediately before event log requests): purpose unknown, CRC2 not yet modelled.
 - **Write / control frames** (power limitation via StecaGrid SEM): not yet captured. Requires running StecaGrid User 4.4 with sniffer while activating feed-in management.
 - **SEM ID `0x7b` ping frames** beyond ID `0x01`: CRC2 offset constant (`0xb6db`), so `calc_crc2_ping(to_id, 0x7b)` works for any ID.
 

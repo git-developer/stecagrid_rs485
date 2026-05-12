@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 """
 steca_sniffer.py — Passive RS485 bus sniffer for StecaGrid 3600
-Threaded UART reader (ChatGPT fix) + CRC2 verification + event log decoder
+Threaded UART reader + CRC2 verification + event log decoder
 
 CRC1: poly=0x39, init=0xAA, refin=True, refout=True, covers frame[0:6] ✓
 CRC2: GF(2) linear model — fully solved:
-  - Ping  (cmd=0x20, 12B):      100% verified, SEM=0xc9 + 0x7b
-  - Req16 (cmd=0x40/0x64, 16B): 100% verified, SEM=0xc9 + 0x7b
+  - Ping  (cmd=0x20, 12B):             100% verified, SEM=0xc9 + 0x7b
+  - Req16 (cmd=0x40/0x64/0x68, 16B):  100% verified, SEM=0xc9 + 0x7b
     · cmd=0x64 base: T_REF=0x05, CRC2_REF=0x8ba1
     · cmd=0x40 offset: XOR 0x572c
+    · cmd=0x68 offset: XOR 0xeef5  (derived from 3 captured frames)
     · SEM=0x7b offset: XOR 0xb1e5 (req16) / XOR 0xb6db (ping)
 
 Usage:
@@ -73,6 +74,7 @@ _M_REQ16 = [
     0x0000, 0x0000, 0xc870, 0x25bd, 0x4b7a, 0x96f4, 0x98b5, 0x8437,
 ]
 _OFF_40 = 0x572c
+_OFF_68 = 0xeef5  # verified: 3/3 captured frames (topics 0x09, 0x5a, 0x5b)
 _OFF_7b = 0xb1e5
 
 def calc_crc2_ping(to_id: int, sem_id: int):
@@ -90,7 +92,8 @@ def calc_crc2_req16(topic: int, cmd: int, sem_id: int):
     for bit in range(8):
         if ((topic ^ _T_REF) >> bit) & 1: crc2 ^= _M_REQ16[bit]
         if ((chk ^ chk_ref) >> bit) & 1:  crc2 ^= _M_REQ16[8 + bit]
-    if cmd == 0x40:      crc2 ^= _OFF_40
+    if cmd == 0x40: crc2 ^= _OFF_40
+    if cmd == 0x68: crc2 ^= _OFF_68
     if   sem_id == 0x7b: crc2 ^= _OFF_7b
     elif sem_id != 0xc9: return None
     return crc2
@@ -102,7 +105,7 @@ def verify_crc2(frame: bytes):
     topic  = frame[11]  if length >= 12 else None
     if length == 12 and cmd == 0x20:
         return calc_crc2_ping(to_id, sem_id), "ping"
-    if length == 16 and cmd in (0x40, 0x64) and to_id == ID_INVERTER and topic is not None:
+    if length == 16 and cmd in (0x40, 0x64, 0x68) and to_id == ID_INVERTER and topic is not None:
         return calc_crc2_req16(topic, cmd, sem_id), f"req16/{cmd:02x}"
     return None, "?"
 
@@ -326,7 +329,7 @@ def main():
     DEBUG_DROPS = args.verbose
 
     print(f"Steca RS485 Sniffer  port={args.port}  baud={SERIAL_BAUDRATE}")
-    print(f"Threaded reader  |  CRC2 model: ping + req16  |  EventLog decoder: p1+p2")
+    print(f"Threaded reader  |  CRC2 model: ping + req16(0x40/0x64/0x68)  |  EventLog decoder: p1+p2")
     if not args.no_log: print(f"Log → {args.log}")
     print("Ctrl+C to stop.\n")
 
