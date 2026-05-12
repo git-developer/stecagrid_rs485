@@ -14,6 +14,7 @@ import struct
 import serial
 import argparse
 import datetime
+import time
 
 DEBUG = False
 
@@ -86,10 +87,13 @@ def build_ping(to_id: int, sem_id: int = SEM_ID) -> bytes:
 
 def build_request16(to_id: int, topic: int, cmd: int,
                     sem_id: int = SEM_ID) -> bytes:
-    """16-byte data-request frame (cmd=0x40 RequestA or cmd=0x64 RequestB)."""
+    """16-byte data-request frame.
+    CRC2 is solved for cmd=0x40 (RequestA) and cmd=0x64 (RequestB).
+    For cmd=0x68 (RequestC / event log) CRC2 is not yet modelled — sent
+    as 0x0000; the inverter may or may not enforce it."""
     h    = bytes([0x02, 0x01, 0x00, 0x10, to_id, sem_id])
     crc1 = calc_crc1(h)
-    crc2 = calc_crc2_req16(topic, cmd, sem_id)
+    crc2 = calc_crc2_req16(topic, cmd, sem_id) if cmd in (0x40, 0x64) else 0x0000
     chk  = (topic + 0x55) & 0xFF
     return h + bytes([crc1, cmd, 0x03, 0x00, 0x01, topic, chk,
                       crc2 >> 8, crc2 & 0xFF, 0x03])
@@ -102,8 +106,10 @@ SG_PANEL_VOLTAGE = build_request16(0x01, 0x23, 0x40)
 SG_PANEL_CURRENT = build_request16(0x01, 0x24, 0x40)
 SG_AC_POWER      = build_request16(0x01, 0x29, 0x40)
 SG_DAILY_YIELD   = build_request16(0x01, 0x3c, 0x40)
-SG_GRID_MEAS     = build_request16(0x01, 0x51, 0x40)
-SG_TIME          = build_request16(0x01, 0x05, 0x64)
+SG_GRID_MEAS      = build_request16(0x01, 0x51, 0x40)
+SG_EVENT_LOG_P1   = build_request16(0x01, 0x5a, 0x68)  # CRC2 experimental
+SG_EVENT_LOG_P2   = build_request16(0x01, 0x5b, 0x68)  # CRC2 experimental
+SG_TIME           = build_request16(0x01, 0x05, 0x64)
 SG_MYSTERY_ONE   = build_request16(0x01, 0x08, 0x64)
 SG_SERIAL        = build_request16(0x01, 0x09, 0x64)
 SG_TOTAL_YIELD   = build_request16(0x01, 0xf1, 0x64)
@@ -143,6 +149,56 @@ def decode_grid_meas(t):
         if DEBUG:
             print(f"# decode_grid_meas error: {e}")
         return []
+
+def _try_ts(data, pos):
+    """Try to parse a 6-byte YY MM DD HH MM SS timestamp at data[pos]."""
+    if pos + 6 > len(data):
+        return None
+    b = data[pos:pos + 6]
+    try:
+        if 0x0d <= b[0] <= 0x1a and 1 <= b[1] <= 12 and 1 <= b[2] <= 31 \
+                and b[3] <= 23 and b[4] <= 59 and b[5] <= 59:
+            return datetime.datetime(2000 + b[0], b[1], b[2], b[3], b[4], b[5])
+    except Exception:
+        pass
+    return None
+
+def decode_event_log(payload: bytes):
+    """Decode a ResponseC event log payload (payload[0] must be 0x69).
+    Returns (total_events, [(datetime_or_None, message_str), ...])."""
+    if len(payload) < 7 or payload[0] != 0x69:
+        return 0, []
+    data  = payload[6:]
+    total = data[0]
+    # Collect deduplicated timestamps
+    raw_ts = [(p, t) for p in range(len(data) - 5) if (t := _try_ts(data, p))]
+    ts_dedup = []
+    for pos, t in raw_ts:
+        if ts_dedup and pos < ts_dedup[-1][0] + 6:
+            continue
+        ts_dedup.append((pos, t))
+    # Collect null-terminated ASCII strings (len >= 4, starts with a letter)
+    msgs, pos = [], 0
+    while pos < len(data):
+        if 65 <= data[pos] <= 122:
+            end = pos
+            while end < len(data) and 32 <= data[end] <= 126:
+                end += 1
+            if end - pos >= 4 and end < len(data) and data[end] == 0x00:
+                msgs.append((pos, data[pos:end].decode('ascii', errors='replace')))
+                pos = end + 1
+                continue
+        pos += 1
+    # Pair each message with the nearest preceding timestamp
+    events = []
+    for msg_pos, msg in msgs:
+        ts = None
+        for ts_pos, t in reversed(ts_dedup):
+            if ts_pos < msg_pos:
+                ts = t
+                break
+        events.append((ts, msg))
+    return total, events
 
 def decode_version(b):
     o = b'SSXSNSSNSSNSSNSSNSSNSSNSSNSSNSSNSSNSSNSSNSSNSSNSSNSSNSSSSSSSSSSSS'
@@ -186,6 +242,38 @@ def is_one_full_telegram(t):
     if len(t) != (t[2] << 8 | t[3]):
         return False
     return True
+
+def read_complete_frame(port, timeout_s=2.0):
+    """Read bytes from port until a complete, valid Steca frame is assembled.
+    Handles partial reads and bus noise; returns bytes or None on timeout."""
+    buf      = bytearray()
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        chunk = port.read(256)
+        if chunk:
+            buf.extend(chunk)
+        # Scan buf for a valid frame regardless of whether chunk was empty
+        while True:
+            idx = buf.find(0x02)
+            if idx == -1:
+                buf.clear()
+                break
+            if idx > 0:
+                del buf[:idx]
+                continue
+            if len(buf) < 4:
+                break                        # need more data
+            frame_len = (buf[2] << 8) | buf[3]
+            if frame_len < 7 or frame_len > 4096:
+                del buf[0]
+                continue
+            if len(buf) < frame_len:
+                break                        # need more data
+            if buf[frame_len - 1] != 0x03:
+                del buf[0]
+                continue
+            return bytes(buf[:frame_len])   # complete frame
+    return None
 
 # ── Frame parser ──────────────────────────────────────────────────────────────
 def process_steca485(t):
@@ -265,6 +353,14 @@ def process_steca485(t):
         else:
             results += ["???", [format_hex_bytes(t[12:17]), ""]]
 
+    elif t[7] == 0x69:  # ResponseC (event log)
+        if t[11] in (0x5a, 0x5b):
+            page = "p1" if t[11] == 0x5a else "p2"
+            total_ev, events = decode_event_log(t[7:-3])
+            results += [f"EventLog-{page}", (total_ev, events)]
+            if DEBUG:
+                print(f"# EventLog-{page}: {total_ev} total, {len(events)} entries")
+
     elif t[7] == 0x21:  # Versions response
         if t[8] == 0x00:
             dlen = (t[9] << 8 | t[10])
@@ -277,15 +373,20 @@ def process_steca485(t):
     return results
 
 # ── Serial I/O ────────────────────────────────────────────────────────────────
-def getStecaGridResult(port, req):
+def getStecaGridResult(port, req, timeout_s=2.0):
     """Send req, read response, return results[5] (the value field)."""
     if DEBUG:
         print("\nserial write:")
         process_steca485(req)
+    port.reset_input_buffer()
     port.write(req)
     if DEBUG:
         print("\nserial read:")
-    in_data = port.read(size=1024)
+    in_data = read_complete_frame(port, timeout_s=timeout_s)
+    if in_data is None:
+        if DEBUG:
+            print("# timeout — no complete frame received")
+        return None
     results = process_steca485(in_data)
     if DEBUG:
         print(results)
@@ -300,29 +401,33 @@ def getStecaGridResult(port, req):
 def discover_inverters(port, full_scan=False):
     id_range   = range(1, 0x66) if full_scan else range(1, 11)
     scan_label = f"0x{id_range.start:02x}..0x{id_range.stop - 1:02x}"
-    print(f"StecaGrid RS485 Bus Discovery")
+    print("StecaGrid RS485 Bus Discovery")
     print(f"  Scanning: {len(id_range)} IDs ({scan_label})")
 
-    found        = []
-    old_timeout  = port.timeout
-    port.timeout = 0.3
+    found       = []
+    old_timeout = port.timeout
+    # Short port timeout so read_complete_frame loops quickly for silent IDs
+    port.timeout = 0.05
 
     for inv_id in id_range:
+        port.reset_input_buffer()
         port.write(build_ping(inv_id))
-        resp = port.read(256)
-        if resp and len(resp) >= 4 and resp[0] == 0x02:
-            frame_len = (resp[2] << 8) | resp[3]
-            if len(resp) >= frame_len and resp[frame_len - 1] == 0x03:
-                found.append(inv_id)
-                port.timeout = old_timeout
-                port.write(build_request16(inv_id, 0x09, 0x64))
-                serial_resp = port.read(1024)
-                serial_res  = process_steca485(serial_resp)
-                serial_str  = ""
+        # Version response can be several hundred bytes; allow 0.5 s total
+        resp_frame = read_complete_frame(port, timeout_s=0.5)
+        if resp_frame:
+            found.append(inv_id)
+            # Query serial number with normal timeout
+            port.timeout = old_timeout
+            port.reset_input_buffer()
+            port.write(build_request16(inv_id, 0x09, 0x64))
+            serial_frame = read_complete_frame(port, timeout_s=old_timeout or 2.0)
+            serial_str   = ""
+            if serial_frame:
+                serial_res = process_steca485(serial_frame)
                 if serial_res and len(serial_res) >= 6:
                     serial_str = f"  Serial: {serial_res[5][0]}"
-                print(f"  0x{inv_id:02x}  ✓ found{serial_str}")
-                port.timeout = 0.3
+            print(f"  0x{inv_id:02x}  ✓ found{serial_str}")
+            port.timeout = 0.05
 
     port.timeout = old_timeout
     print(f"\nResult: {len(found)} inverter(s) on bus.")
@@ -342,6 +447,7 @@ if __name__ == "__main__":
     parser.add_argument('-pc', '--panel_current', action='store_true', help='Request panel current')
     parser.add_argument('-ap', '--ac_power',      action='store_true', help='Request AC power')
     parser.add_argument('-gm', '--grid_meas',     action='store_true', help='Request grid measurements (ENS1+ENS2)')
+    parser.add_argument('-el', '--event_log',     action='store_true', help='Request event log (both pages)')
     parser.add_argument('-dy', '--daily_yield',   action='store_true', help='Request daily yield')
     parser.add_argument('-ty', '--total_yield',   action='store_true', help='Request total yield')
     parser.add_argument('-ti', '--time',          action='store_true', help='Request inverter time')
@@ -373,8 +479,27 @@ if __name__ == "__main__":
         port.close()
         raise SystemExit(0)
 
+    if args.event_log:
+        # Event log: request both pages sequentially (CRC2 unverified for cmd=0x68)
+        for topic, page in ((0x5a, "p1"), (0x5b, "p2")):
+            req   = build_request16(inv_id, topic, 0x68)
+            value = getStecaGridResult(port, req, timeout_s=3.0)
+            if value is None:
+                print(f"EventLog-{page}: no response (CRC2 for cmd=0x68 not yet solved)")
+                continue
+            if isinstance(value, tuple):
+                total_ev, events = value
+                print(f"EventLog-{page} ({total_ev} total, {len(events)} in this frame):")
+                for ts_ev, msg in events:
+                    ts_str = ts_ev.strftime("%Y-%m-%d %H:%M:%S") if ts_ev else "????-??-?? ??:??:??"
+                    print(f"  {ts_str}  {msg}")
+            else:
+                print(f"EventLog-{page}: unexpected response: {value}")
+        port.close()
+        raise SystemExit(0)
+
     # Build the request frame for the selected inverter ID
-    if args.nominal_power: reqval = build_request16(inv_id, 0x1d, 0x40)
+    if args.nominal_power:   reqval = build_request16(inv_id, 0x1d, 0x40)
     elif args.panel_power:   reqval = build_request16(inv_id, 0x22, 0x40)
     elif args.panel_voltage: reqval = build_request16(inv_id, 0x23, 0x40)
     elif args.panel_current: reqval = build_request16(inv_id, 0x24, 0x40)
