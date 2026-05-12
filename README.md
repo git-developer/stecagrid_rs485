@@ -225,7 +225,7 @@ $ python3 getStecaGridData.py -ty -u
 $ python3 getStecaGridData.py --discover --full-scan
 StecaGrid RS485 Bus Discovery
   Scanning: 101 IDs (0x01..0x65)
-  0x01  ✓ found  Serial: 748613YI005212850029
+  0x01  ✓ found  Serial: XXXXXXXXXXXXXXXXXXXX
   ...
 Result: 1 inverter(s) on bus.
 ```
@@ -274,7 +274,7 @@ python3 steca_sniffer.py --port /dev/ttyUSB0 --no-log    # suppress JSON log
 ## Based on Versions
 Tested with the following firmware. Your mileage may vary.
 ```
-StecaGrid 3600  Serial: 748613YI005212850029
+StecaGrid 3600  Serial: XXXXXXXXXXXXXXXXXXXX
 
 HMI BFAPI   5.0.0   19.03.2013 14:38:59
 HMI FBL     2.0.3   05.04.2013 11:46:20
