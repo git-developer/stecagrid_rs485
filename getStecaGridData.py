@@ -2,12 +2,8 @@
 """
 getStecaGridData.py — Read data via RS485 from StecaGrid 3600
 
-CRC1 (solved): poly=0x139, init=0xAA, rev=True, covers frame[0:6]
-CRC2 (solved): GF(2) linear model, verified for ping (12 B) and
-               data requests (16 B, cmd=0x40 / 0x64)
-
-Frames are now synthesized for any inverter ID — use --id to target
-a specific inverter instead of the default 0x01.
+CRC1 and CRC2 are computed by steca_crc.py (nibble-table algorithms).
+Use --discover / --full-scan to find inverters, then query by --id.
 """
 
 import struct
@@ -15,6 +11,8 @@ import serial
 import argparse
 import datetime
 import time
+
+from steca_crc import build_frame
 
 DEBUG = False
 
@@ -27,92 +25,45 @@ SERIAL_TIMEOUT  = 1
 
 SEM_ID = 0x7b
 
-# ── CRC1 ──────────────────────────────────────────────────────────────────────
-try:
-    import crcmod
-    _crc1_fn = crcmod.mkCrcFun(0x139, initCrc=0xAA, rev=True, xorOut=0x00)
-    def calc_crc1(b6: bytes) -> int:
-        return _crc1_fn(b6)
-except ImportError:
-    def calc_crc1(b6: bytes) -> int:
-        poly, crc = 0x39, 0xAA
-        for byte in b6:
-            byte = int(f'{byte:08b}'[::-1], 2)
-            crc ^= byte
-            for _ in range(8):
-                crc = ((crc << 1) ^ poly) & 0xFF if crc & 0x80 else (crc << 1) & 0xFF
-        return int(f'{crc:08b}'[::-1], 2)
-
-# ── CRC2 GF(2) linear model ───────────────────────────────────────────────────
-_M_PING      = [0x39b2, 0x7364, 0xe6c8, 0x78cd, 0xf19a, 0x5669, 0xacd2, 0x0000]
-_BASE_PING   = 0xf6e5
-_OFF_PING_7b = 0xb6db
-
-_T_REF   = 0x05
-_C_REF   = 0x8ba1
-_M_REQ16 = [
-    0x87c7, 0x72a3, 0x2d36, 0x5a6c, 0xb4d8, 0xdced, 0x0c87, 0x190e,
-    0x0000, 0x0000, 0xc870, 0x25bd, 0x4b7a, 0x96f4, 0x98b5, 0x8437,
-]
-_OFF_40 = 0x572c
-_OFF_68 = 0xeef5  # verified: 3/3 captured frames (topics 0x09, 0x5a, 0x5b)
-_OFF_7b = 0xb1e5
-
-def calc_crc2_ping(to_id: int, sem_id: int = SEM_ID) -> int:
-    crc2 = _BASE_PING
-    for bit in range(8):
-        if to_id & (1 << bit): crc2 ^= _M_PING[bit]
-    if   sem_id == 0x7b: crc2 ^= _OFF_PING_7b
-    elif sem_id != 0xc9: raise ValueError(f"unsupported SEM ID 0x{sem_id:02x}")
-    return crc2
-
-def calc_crc2_req16(topic: int, cmd: int, sem_id: int = SEM_ID) -> int:
-    chk_ref = (_T_REF + 0x55) & 0xFF
-    chk     = (topic  + 0x55) & 0xFF
-    crc2    = _C_REF
-    for bit in range(8):
-        if ((topic ^ _T_REF) >> bit) & 1: crc2 ^= _M_REQ16[bit]
-        if ((chk ^ chk_ref) >> bit) & 1:  crc2 ^= _M_REQ16[8 + bit]
-    if cmd == 0x40: crc2 ^= _OFF_40
-    if cmd == 0x68: crc2 ^= _OFF_68
-    if   sem_id == 0x7b: crc2 ^= _OFF_7b
-    elif sem_id != 0xc9: raise ValueError(f"unsupported SEM ID 0x{sem_id:02x}")
-    return crc2
+# ── Topic registry ────────────────────────────────────────────────────────────
+# name → (topic_byte, cmd_byte)
+TOPICS = {
+    "nominal_power": (0x1d, 0x40),
+    "panel_power":   (0x22, 0x40),
+    "panel_voltage": (0x23, 0x40),
+    "panel_current": (0x24, 0x40),
+    "ac_power":      (0x29, 0x40),
+    "daily_yield":   (0x3c, 0x40),
+    "grid_meas":     (0x51, 0x40),
+    "event_log_p1":  (0x5a, 0x68),
+    "event_log_p2":  (0x5b, 0x68),
+    "time":          (0x05, 0x64),
+    "mystery_08":    (0x08, 0x64),
+    "serial":        (0x09, 0x64),
+    "total_yield":   (0xf1, 0x64),
+}
 
 # ── Frame builders ────────────────────────────────────────────────────────────
 def build_ping(to_id: int, sem_id: int = SEM_ID) -> bytes:
     """12-byte ping / bus-discovery frame."""
-    h    = bytes([0x02, 0x01, 0x00, 0x0c, to_id, sem_id])
-    crc1 = calc_crc1(h)
-    crc2 = calc_crc2_ping(to_id, sem_id)
-    return h + bytes([crc1, 0x20, 0x03, crc2 >> 8, crc2 & 0xFF, 0x03])
+    return build_frame(to_id, sem_id, bytes([0x20, 0x03]))
 
-def build_request16(to_id: int, topic: int, cmd: int,
-                    sem_id: int = SEM_ID) -> bytes:
-    """16-byte data-request frame.
-    CRC2 solved for cmd=0x40 (RequestA), 0x64 (RequestB), 0x68 (RequestC)."""
-    h    = bytes([0x02, 0x01, 0x00, 0x10, to_id, sem_id])
-    crc1 = calc_crc1(h)
-    crc2 = calc_crc2_req16(topic, cmd, sem_id) if cmd in (0x40, 0x64, 0x68) else 0x0000
-    chk  = (topic + 0x55) & 0xFF
-    return h + bytes([crc1, cmd, 0x03, 0x00, 0x01, topic, chk,
-                      crc2 >> 8, crc2 & 0xFF, 0x03])
 
-# ── Pre-built frames for inverter ID 0x01, SEM 0x7b (synthesized) ─────────────
-SG_VERSIONS      = build_ping(0x01)
-SG_NOMINAL_POWER = build_request16(0x01, 0x1d, 0x40)
-SG_PANEL_POWER   = build_request16(0x01, 0x22, 0x40)
-SG_PANEL_VOLTAGE = build_request16(0x01, 0x23, 0x40)
-SG_PANEL_CURRENT = build_request16(0x01, 0x24, 0x40)
-SG_AC_POWER      = build_request16(0x01, 0x29, 0x40)
-SG_DAILY_YIELD   = build_request16(0x01, 0x3c, 0x40)
-SG_GRID_MEAS      = build_request16(0x01, 0x51, 0x40)
-SG_EVENT_LOG_P1   = build_request16(0x01, 0x5a, 0x68)
-SG_EVENT_LOG_P2   = build_request16(0x01, 0x5b, 0x68)
-SG_TIME           = build_request16(0x01, 0x05, 0x64)
-SG_MYSTERY_ONE   = build_request16(0x01, 0x08, 0x64)
-SG_SERIAL        = build_request16(0x01, 0x09, 0x64)
-SG_TOTAL_YIELD   = build_request16(0x01, 0xf1, 0x64)
+def build_request(to_id: int, topic: int, cmd: int,
+                  sem_id: int = SEM_ID) -> bytes:
+    """16-byte data-request frame for any (topic, cmd) pair."""
+    chk = (topic + 0x55) & 0xFF
+    return build_frame(to_id, sem_id, bytes([cmd, 0x03, 0x00, 0x01, topic, chk]))
+
+
+def build_power_limit_frame(step: int) -> bytes:
+    """Power-limit control frame (cmd=0x34, hypothesis: step=0→100%, 1→60%, 2→30%, 3→0%).
+    Unverified — send and inspect the inverter response experimentally."""
+    return build_frame(0x01, SEM_ID, bytes([0x34, step & 0xFF]))
+
+
+# Pre-computed ping frames for all RS485 IDs (avoids per-scan alloc)
+PING_FRAMES = {i: build_ping(i) for i in range(1, 0x66)}
 
 # ── Value decoders ────────────────────────────────────────────────────────────
 def decode_stecaFloat_a(ac_bytes):
@@ -126,10 +77,12 @@ def decode_stecaFloat_a(ac_bytes):
         print("# f:", facpower)
     return [facpower, unit]
 
+
 def decode_TotalYield_a(ba):
     bits = ba[3] << 24 | ba[2] << 16 | ba[1] << 8 | ba[0]
     ieee, = struct.unpack('f', struct.pack('I', bits))
     return [ieee, "Wh"]
+
 
 def decode_grid_meas(t):
     """Decode GridMeasurements response (topic=0x51, ResponseA).
@@ -139,7 +92,6 @@ def decode_grid_meas(t):
         label_a     = t[15 : 15 + label_a_len].decode('ascii', errors='replace')
         va          = 15 + label_a_len
         vals_a      = [decode_stecaFloat_a(t[va + i*4 : va + i*4 + 4]) for i in range(4)]
-        # separator byte at va+16, label_b length at va+17..18, label_b at va+19
         label_b_len = (t[va + 17] << 8) | t[va + 18]
         vb          = va + 19 + label_b_len
         label_b     = t[va + 19 : vb].decode('ascii', errors='replace')
@@ -149,6 +101,7 @@ def decode_grid_meas(t):
         if DEBUG:
             print(f"# decode_grid_meas error: {e}")
         return []
+
 
 def _try_ts(data, pos):
     """Try to parse a 6-byte YY MM DD HH MM SS timestamp at data[pos]."""
@@ -163,6 +116,7 @@ def _try_ts(data, pos):
         pass
     return None
 
+
 def decode_event_log(payload: bytes):
     """Decode a ResponseC event log payload (payload[0] must be 0x69).
     Returns (total_events, [(datetime_or_None, message_str), ...])."""
@@ -170,14 +124,12 @@ def decode_event_log(payload: bytes):
         return 0, []
     data  = payload[6:]
     total = data[0]
-    # Collect deduplicated timestamps
     raw_ts = [(p, t) for p in range(len(data) - 5) if (t := _try_ts(data, p))]
     ts_dedup = []
     for pos, t in raw_ts:
         if ts_dedup and pos < ts_dedup[-1][0] + 6:
             continue
         ts_dedup.append((pos, t))
-    # Collect null-terminated ASCII strings (len >= 4, starts with a letter)
     msgs, pos = [], 0
     while pos < len(data):
         if 65 <= data[pos] <= 122:
@@ -189,7 +141,6 @@ def decode_event_log(payload: bytes):
                 pos = end + 1
                 continue
         pos += 1
-    # Pair each message with the nearest preceding timestamp
     events = []
     for msg_pos, msg in msgs:
         ts = None
@@ -199,6 +150,7 @@ def decode_event_log(payload: bytes):
                 break
         events.append((ts, msg))
     return total, events
+
 
 def decode_version(b):
     o = b'SSXSNSSNSSNSSNSSNSSNSSNSSNSSNSSNSSNSSNSSNSSNSSNSSNSSNSSSSSSSSSSSS'
@@ -231,8 +183,10 @@ def decode_version(b):
 def format_hex_bytes(b):
     return ' '.join(f'{byte:02x}' for byte in b)
 
+
 def format_printable(b):
     return ''.join(chr(byte) if 32 <= byte <= 126 else '.' for byte in b)
+
 
 def is_one_full_telegram(t):
     if not t or t[0] != 2:
@@ -243,6 +197,7 @@ def is_one_full_telegram(t):
         return False
     return True
 
+
 def read_complete_frame(port, timeout_s=2.0):
     """Read bytes from port until a complete, valid Steca frame is assembled.
     Handles partial reads and bus noise; returns bytes or None on timeout."""
@@ -252,7 +207,6 @@ def read_complete_frame(port, timeout_s=2.0):
         chunk = port.read(256)
         if chunk:
             buf.extend(chunk)
-        # Scan buf for a valid frame regardless of whether chunk was empty
         while True:
             idx = buf.find(0x02)
             if idx == -1:
@@ -262,17 +216,17 @@ def read_complete_frame(port, timeout_s=2.0):
                 del buf[:idx]
                 continue
             if len(buf) < 4:
-                break                        # need more data
+                break
             frame_len = (buf[2] << 8) | buf[3]
             if frame_len < 7 or frame_len > 4096:
                 del buf[0]
                 continue
             if len(buf) < frame_len:
-                break                        # need more data
+                break
             if buf[frame_len - 1] != 0x03:
                 del buf[0]
                 continue
-            return bytes(buf[:frame_len])   # complete frame
+            return bytes(buf[:frame_len])
     return None
 
 # ── Frame parser ──────────────────────────────────────────────────────────────
@@ -387,7 +341,7 @@ def getStecaGridResult(port, req, timeout_s=2.0, retries=3):
         if in_data is None:
             if DEBUG:
                 print("# timeout — no complete frame received")
-            break  # no response at all — don't retry (wrong CRC2, device absent, …)
+            break
         results = process_steca485(in_data)
         if DEBUG:
             print(results)
@@ -396,8 +350,6 @@ def getStecaGridResult(port, req, timeout_s=2.0, retries=3):
             if isinstance(val, list) and len(val) == 2 and val[1] == "NUL":
                 return None
             return val
-        # Valid frame received but no usable value (error/busy status byte).
-        # The inverter was mid-exchange with the SEM — wait and retry.
         if attempt < retries - 1:
             if DEBUG:
                 print("# error response, retrying…")
@@ -413,20 +365,17 @@ def discover_inverters(port, full_scan=False):
 
     found       = []
     old_timeout = port.timeout
-    # Short port timeout so read_complete_frame loops quickly for silent IDs
     port.timeout = 0.05
 
     for inv_id in id_range:
         port.reset_input_buffer()
-        port.write(build_ping(inv_id))
-        # Version response can be several hundred bytes; allow 0.5 s total
+        port.write(PING_FRAMES[inv_id])
         resp_frame = read_complete_frame(port, timeout_s=0.5)
         if resp_frame:
             found.append(inv_id)
-            # Query serial number with normal timeout
             port.timeout = old_timeout
             port.reset_input_buffer()
-            port.write(build_request16(inv_id, 0x09, 0x64))
+            port.write(build_request(inv_id, *TOPICS["serial"]))
             serial_frame = read_complete_frame(port, timeout_s=old_timeout or 2.0)
             serial_str   = ""
             if serial_frame:
@@ -465,6 +414,10 @@ if __name__ == "__main__":
                         help='Scan RS485 bus for inverters (quick: IDs 0x01..0x0a)')
     parser.add_argument('--full-scan',            action='store_true',
                         help='Used with --discover: full scan IDs 0x01..0x65')
+    parser.add_argument('--power-limit', type=int, choices=[0, 1, 2, 3],
+                        metavar='{0,1,2,3}',
+                        help='Send power limit frame: 0=100%%, 1=60%%, 2=30%%, 3=0%% '
+                             '(cmd=0x34, experimental)')
 
     args  = parser.parse_args()
     DEBUG = args.verbose
@@ -486,10 +439,24 @@ if __name__ == "__main__":
         port.close()
         raise SystemExit(0)
 
+    if args.power_limit is not None:
+        req = build_power_limit_frame(args.power_limit)
+        if DEBUG:
+            print(f"# power_limit step={args.power_limit} frame: {req.hex()}")
+        port.reset_input_buffer()
+        port.write(req)
+        resp = read_complete_frame(port, timeout_s=2.0)
+        if resp:
+            print(f"PowerLimit response: {format_hex_bytes(resp)}")
+        else:
+            print("PowerLimit: no response")
+        port.close()
+        raise SystemExit(0)
+
     if args.event_log:
-        # Event log: request both pages sequentially (CRC2 unverified for cmd=0x68)
-        for topic, page in ((0x5a, "p1"), (0x5b, "p2")):
-            req   = build_request16(inv_id, topic, 0x68)
+        for name in ("event_log_p1", "event_log_p2"):
+            page = name.split("_", 2)[2]   # "p1" or "p2"
+            req   = build_request(inv_id, *TOPICS[name])
             value = getStecaGridResult(port, req, timeout_s=3.0)
             if value is None:
                 print(f"EventLog-{page}: no response")
@@ -506,19 +473,19 @@ if __name__ == "__main__":
         raise SystemExit(0)
 
     # Build the request frame for the selected inverter ID
-    if args.nominal_power:   reqval = build_request16(inv_id, 0x1d, 0x40)
-    elif args.panel_power:   reqval = build_request16(inv_id, 0x22, 0x40)
-    elif args.panel_voltage: reqval = build_request16(inv_id, 0x23, 0x40)
-    elif args.panel_current: reqval = build_request16(inv_id, 0x24, 0x40)
-    elif args.ac_power:      reqval = build_request16(inv_id, 0x29, 0x40)
-    elif args.grid_meas:     reqval = build_request16(inv_id, 0x51, 0x40)
-    elif args.daily_yield:   reqval = build_request16(inv_id, 0x3c, 0x40)
-    elif args.total_yield:   reqval = build_request16(inv_id, 0xf1, 0x64)
-    elif args.time:          reqval = build_request16(inv_id, 0x05, 0x64)
-    elif args.serial_number: reqval = build_request16(inv_id, 0x09, 0x64)
+    if args.nominal_power:   reqval = build_request(inv_id, *TOPICS["nominal_power"])
+    elif args.panel_power:   reqval = build_request(inv_id, *TOPICS["panel_power"])
+    elif args.panel_voltage: reqval = build_request(inv_id, *TOPICS["panel_voltage"])
+    elif args.panel_current: reqval = build_request(inv_id, *TOPICS["panel_current"])
+    elif args.ac_power:      reqval = build_request(inv_id, *TOPICS["ac_power"])
+    elif args.grid_meas:     reqval = build_request(inv_id, *TOPICS["grid_meas"])
+    elif args.daily_yield:   reqval = build_request(inv_id, *TOPICS["daily_yield"])
+    elif args.total_yield:   reqval = build_request(inv_id, *TOPICS["total_yield"])
+    elif args.time:          reqval = build_request(inv_id, *TOPICS["time"])
+    elif args.serial_number: reqval = build_request(inv_id, *TOPICS["serial"])
     elif args.versions:      reqval = build_ping(inv_id)
-    elif args.mystery_one:   reqval = build_request16(inv_id, 0x08, 0x64)
-    else:                    reqval = build_request16(inv_id, 0xf1, 0x64)  # default: total yield
+    elif args.mystery_one:   reqval = build_request(inv_id, *TOPICS["mystery_08"])
+    else:                    reqval = build_request(inv_id, *TOPICS["total_yield"])
 
     value = getStecaGridResult(port, reqval)
 

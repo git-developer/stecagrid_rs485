@@ -1,22 +1,16 @@
 #!/usr/bin/env python3
 """
 steca_sniffer.py — Passive RS485 bus sniffer for StecaGrid 3600
-Threaded UART reader + CRC2 verification + event log decoder
+Threaded UART reader + CRC verification (nibble-table) + event log decoder
 
-CRC1: poly=0x39, init=0xAA, refin=True, refout=True, covers frame[0:6] ✓
-CRC2: GF(2) linear model — fully solved:
-  - Ping  (cmd=0x20, 12B):             100% verified, SEM=0xc9 + 0x7b
-  - Req16 (cmd=0x40/0x64/0x68, 16B):  100% verified, SEM=0xc9 + 0x7b
-    · cmd=0x64 base: T_REF=0x05, CRC2_REF=0x8ba1
-    · cmd=0x40 offset: XOR 0x572c
-    · cmd=0x68 offset: XOR 0xeef5  (derived from 3 captured frames)
-    · SEM=0x7b offset: XOR 0xb1e5 (req16) / XOR 0xb6db (ping)
+CRC1: CRC-8 nibble-table, init=0x55, covers frame[0:6]
+CRC2: CRC-16 nibble-table, init=0x5555, covers frame[:-3] + ETX — all frame types ✓
 
 Usage:
   python3 steca_sniffer.py --port /dev/ttyUSB0
   python3 steca_sniffer.py --port /dev/ttyUSB0 --verbose
 
-Install: pip3 install pyserial crcmod
+Install: pip3 install pyserial
 """
 
 import serial
@@ -28,6 +22,8 @@ import sys
 import threading
 import queue
 import time
+
+from steca_crc import crc1 as _crc1, crc2 as _crc2
 
 SERIAL_BAUDRATE = 38400
 SERIAL_TIMEOUT  = 0.02   # short — thread reads continuously
@@ -46,68 +42,14 @@ TOPIC_NAMES = {
     0xf1: "TotalYield",
 }
 
-# ── CRC1 ─────────────────────────────────────────────────────────────────────
-try:
-    import crcmod
-    _crc1_fn = crcmod.mkCrcFun(0x139, initCrc=0xAA, rev=True, xorOut=0x00)
-    def calc_crc1(frame: bytes) -> int:
-        return _crc1_fn(frame[0:6])
-except ImportError:
-    def calc_crc1(frame: bytes) -> int:
-        poly, crc = 0x39, 0xAA
-        for byte in frame[0:6]:
-            byte = int(f'{byte:08b}'[::-1], 2)
-            crc ^= byte
-            for _ in range(8):
-                crc = ((crc << 1) ^ poly) & 0xFF if crc & 0x80 else (crc << 1) & 0xFF
-        return int(f'{crc:08b}'[::-1], 2)
-
-# ── CRC2 GF(2) linear model ───────────────────────────────────────────────────
-_M_PING      = [0x39b2, 0x7364, 0xe6c8, 0x78cd, 0xf19a, 0x5669, 0xacd2, 0x0000]
-_BASE_PING   = 0xf6e5
-_OFF_PING_7b = 0xb6db
-
-_T_REF   = 0x05
-_C_REF   = 0x8ba1
-_M_REQ16 = [
-    0x87c7, 0x72a3, 0x2d36, 0x5a6c, 0xb4d8, 0xdced, 0x0c87, 0x190e,
-    0x0000, 0x0000, 0xc870, 0x25bd, 0x4b7a, 0x96f4, 0x98b5, 0x8437,
-]
-_OFF_40 = 0x572c
-_OFF_68 = 0xeef5  # verified: 3/3 captured frames (topics 0x09, 0x5a, 0x5b)
-_OFF_7b = 0xb1e5
-
-def calc_crc2_ping(to_id: int, sem_id: int):
-    crc2 = _BASE_PING
-    for bit in range(8):
-        if to_id & (1 << bit): crc2 ^= _M_PING[bit]
-    if   sem_id == 0x7b: crc2 ^= _OFF_PING_7b
-    elif sem_id != 0xc9: return None
-    return crc2
-
-def calc_crc2_req16(topic: int, cmd: int, sem_id: int):
-    chk_ref = (_T_REF + 0x55) & 0xFF
-    chk     = (topic  + 0x55) & 0xFF
-    crc2    = _C_REF
-    for bit in range(8):
-        if ((topic ^ _T_REF) >> bit) & 1: crc2 ^= _M_REQ16[bit]
-        if ((chk ^ chk_ref) >> bit) & 1:  crc2 ^= _M_REQ16[8 + bit]
-    if cmd == 0x40: crc2 ^= _OFF_40
-    if cmd == 0x68: crc2 ^= _OFF_68
-    if   sem_id == 0x7b: crc2 ^= _OFF_7b
-    elif sem_id != 0xc9: return None
-    return crc2
+# ── CRC helpers ───────────────────────────────────────────────────────────────
+def calc_crc1(frame: bytes) -> int:
+    return _crc1(frame)
 
 def verify_crc2(frame: bytes):
-    length = (frame[2] << 8) | frame[3]
-    to_id  = frame[4];  sem_id = frame[5]
-    cmd    = frame[7]   if length > 7  else None
-    topic  = frame[11]  if length >= 12 else None
-    if length == 12 and cmd == 0x20:
-        return calc_crc2_ping(to_id, sem_id), "ping"
-    if length == 16 and cmd in (0x40, 0x64, 0x68) and to_id == ID_INVERTER and topic is not None:
-        return calc_crc2_req16(topic, cmd, sem_id), f"req16/{cmd:02x}"
-    return None, "?"
+    """Verify CRC2 for any frame type using the nibble-table CRC-16."""
+    expected = _crc2(frame[:-3])
+    return expected, "nibble_crc16"
 
 # ── Value decoders ────────────────────────────────────────────────────────────
 def _steca_float(b):
@@ -329,7 +271,7 @@ def main():
     DEBUG_DROPS = args.verbose
 
     print(f"Steca RS485 Sniffer  port={args.port}  baud={SERIAL_BAUDRATE}")
-    print(f"Threaded reader  |  CRC2 model: ping + req16(0x40/0x64/0x68)  |  EventLog decoder: p1+p2")
+    print(f"Threaded reader  |  CRC1+CRC2: nibble-table (all frame types)  |  EventLog decoder: p1+p2")
     if not args.no_log: print(f"Log → {args.log}")
     print("Ctrl+C to stop.\n")
 
