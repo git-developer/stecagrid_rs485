@@ -22,30 +22,30 @@ to communicate with StecaGrid inverters. Newer inverter models have an XML/HTTP 
 
 LEN = total frame length including STX (0x02) and ETX (0x03)
 ```
-- **STX** `0x02`, **ETX** `0x03`
-- **LEN** big-endian uint16 at bytes [2:4] = total frame length
-- **TO / FROM** RS485 device IDs (inverter = `0x01`, SEM = `0x7b` or `0xc9`)
-- **CRC1** covers bytes `[0:6]` — see [CRC section](#crc)
-- **CRC2** is the last 2 bytes before ETX — see [CRC section](#crc)
+- **STX** `0x02`, **ETX** `0x03`  
+- **LEN** big-endian uint16 at bytes [2:4] = total frame length  
+- **TO / FROM** RS485 device IDs (inverter = `0x01`, SEM = `0x7b` or `0xc9`)  
+- **CRC1** covers bytes `[0:6]` — see [CRC section](#crc)  
+- **CRC2** is the last 2 bytes before ETX — see [CRC section](#crc)  
 - **Payload** starts at byte 7; first byte = command, byte 5 = topic
 
 ### Command Bytes
 | Direction | Cmd | Meaning |
 |-----------|-----|---------|
 | Request  | `0x20` | Ping / bus discovery |
+| Request  | `0x34` | Unknown (seen before event log requests) |
 | Request  | `0x40` | Request type A (measurement values) |
 | Request  | `0x54` | Request type D |
 | Request  | `0x60` | Request type E |
 | Request  | `0x64` | Request type B (yield, time, serial) |
-| Request  | `0x34` | Unknown (seen before event log; CRC2 not yet modelled) |
 | Request  | `0x68` | Request type C (event log, serial detail) |
+| Response | `0x21` | Versions response |
+| Response | `0x35` | Unknown response to `0x34` |
 | Response | `0x41` | Response type A |
 | Response | `0x55` | Response type D |
 | Response | `0x61` | Response type E |
 | Response | `0x65` | Response type B |
-| Response | `0x35` | Unknown response to 0x34 |
 | Response | `0x69` | Response type C |
-| Response | `0x21` | Versions response |
 
 ### Known Topics
 | Topic | Name | Cmd | Unit / Format |
@@ -92,106 +92,78 @@ Only responding devices are queried further. On a single-inverter system, only I
 
 ## CRC
 
+Both CRC algorithms were fully solved by combining passive RS485 sniffing
+(101 ping frames, 68+ data request frames) with cross-referencing the
+independent implementation by MichaelOE:
+[homeassistant-stecagrid/steca.py](https://github.com/MichaelOE/homeassistant-stecagrid/blob/main/custom_components/stecagrid/steca.py)
+
+Both use a **nibble-based lookup table** approach (not standard CRC polynomials).
+
+```python
+CRC8_TABLE  = [0x00, 0x8F, 0x27, 0xA8, 0x4E, 0xC1, 0x69, 0xE6,
+               0x9C, 0x13, 0xBB, 0x34, 0xD2, 0x5D, 0xF5, 0x7A]
+CRC16_TABLE = [0x0000, 0xACAC, 0xEC05, 0x40A9, 0x6D57, 0xC1FB, 0x8152, 0x2DFE,
+               0xDAAE, 0x7602, 0x36AB, 0x9A07, 0xB7F9, 0x1B55, 0x5BFC, 0xF750]
+
+def crc8_nibble(data: bytes, init: int = 0x55) -> int:
+    crc = init
+    for b in data:
+        crc ^= b
+        crc = (crc >> 4) ^ CRC8_TABLE[crc & 0x0F]
+        crc = (crc >> 4) ^ CRC8_TABLE[crc & 0x0F]
+    return crc & 0xFF
+
+def crc16_nibble(data: bytes, init: int = 0x5555) -> int:
+    crc = init
+    for b in data:
+        crc ^= b
+        crc = (crc >> 4) ^ CRC16_TABLE[crc & 0x000F]
+        crc = (crc >> 4) ^ CRC16_TABLE[crc & 0x000F]
+    return crc & 0xFFFF
+
+def build_frame(to: int, frm: int, payload: bytes) -> bytes:
+    total_len = len(payload) + 10
+    header = bytes([0x02, 0x01, 0x00, total_len, to, frm])
+    c1     = crc8_nibble(header)
+    body   = header + bytes([c1]) + payload
+    c2     = crc16_nibble(body + b'\x03')
+    return body + bytes([c2 >> 8, c2 & 0xFF, 0x03])
+```
+
 ### CRC1 — **Fully solved** ✓
+```python
+crc1 = crc8_nibble(frame[0:6], init=0x55)
+```
 Covers frame bytes `[0:6]` (STX through FROM byte).
+Verified against all known frames.
+
+### CRC2 — **Fully solved** ✓
 ```python
-import crcmod
-crc1_fn = crcmod.mkCrcFun(0x139, initCrc=0xAA, rev=True, xorOut=0x00)
-crc1 = crc1_fn(frame[0:6])
+crc2 = crc16_nibble(frame[:-3] + b'\x03', init=0x5555)
 ```
-| Parameter | Value |
-|-----------|-------|
-| Polynomial | `0x39` (0x139 with implicit leading 1) |
-| Init | `0xAA` |
-| Reflected input | Yes |
-| Reflected output | Yes |
-| XOR out | `0x00` |
+Covers the entire frame **excluding** the two CRC2 bytes,
+**including** the ETX byte `0x03`.
 
-### CRC2 — **Fully solved via GF(2) linear model** ✓
-CRC2 is a **GF(2) linear function** of the frame bytes — not a standard CRC polynomial.
-It was reverse-engineered from 101 ping frames and 68 data request frames captured
-by passive RS485 sniffing of StecaGrid User 4.4 (SEM ID `0xc9`).
-
-#### Ping frames (cmd=`0x20`, 12 bytes)
-```python
-M_COL_PING = [0x39b2, 0x7364, 0xe6c8, 0x78cd,
-              0xf19a, 0x5669, 0xacd2, 0x0000]
-BASE_PING   = 0xf6e5
-OFFSET_7b   = 0xb6db   # XOR to convert SEM=0xc9 → SEM=0x7b
-
-def calc_crc2_ping(to_id: int, sem_id: int = 0xc9) -> int:
-    crc2 = BASE_PING
-    for bit in range(8):
-        if to_id & (1 << bit):
-            crc2 ^= M_COL_PING[bit]
-    if sem_id == 0x7b:
-        crc2 ^= OFFSET_7b
-    return crc2
-```
-Verified: **101/101 frames correct** (all IDs `0x01`..`0x65`).
-
-#### 16-byte data requests (cmd=`0x40` / `0x64`, TO=`0x01`)
-```python
-T_REF     = 0x05
-CRC2_REF  = 0x8ba1   # CRC2 for T=0x05, cmd=0x64, SEM=0xc9
-M_COL_64  = [
-    0x87c7, 0x72a3, 0x2d36, 0x5a6c,   # topic bits 0-3
-    0xb4d8, 0xdced, 0x0c87, 0x190e,   # topic bits 4-7
-    0x0000, 0x0000, 0xc870, 0x25bd,   # chk bits 0-3  (chk = topic + 0x55)
-    0x4b7a, 0x96f4, 0x98b5, 0x8437,   # chk bits 4-7
-]
-OFFSET_40 = 0x572c   # XOR for cmd=0x40 vs cmd=0x64
-OFFSET_7b = 0xb1e5   # XOR for SEM=0x7b vs SEM=0xc9
-
-def calc_crc2_request16(topic: int, cmd: int = 0x64,
-                        sem_id: int = 0xc9) -> int:
-    chk_ref = (T_REF + 0x55) & 0xFF
-    chk     = (topic + 0x55) & 0xFF
-    crc2    = CRC2_REF
-    for bit in range(8):
-        if ((topic ^ T_REF) >> bit) & 1: crc2 ^= M_COL_64[bit]
-        if ((chk ^ chk_ref) >> bit) & 1: crc2 ^= M_COL_64[8 + bit]
-    if cmd == 0x40:    crc2 ^= OFFSET_40
-    if sem_id == 0x7b: crc2 ^= OFFSET_7b
-    return crc2
-```
-Verified: **68/68 topics correct** for cmd=`0x64`; **9/9 correct** for cmd=`0x40`.
-
-#### Event log / serial detail requests (cmd=`0x68`)
-
-Same model as above, with an additional offset:
-
-```python
-OFFSET_68 = 0xeef5   # XOR for cmd=0x68 vs cmd=0x64
-```
-
-Add `if cmd == 0x68: crc2 ^= OFFSET_68` in `calc_crc2_request16`.
-
-Verified: **3/3 captured frames correct** (topics `0x09`, `0x5a`, `0x5b`, SEM=`0xc9`).
+Verified against all known frame types: ping, read (`0x40`/`0x64`/`0x68`), write (`0x34`), responses.
 
 ---
 
 ## Request Frames
-All frames below use SEM ID `0x7b`. CRC2 values are derived from the linear model.
 
-### Synthesized (CRC2 computed, any topic supported)
-```python
-# Use calc_crc2_request16(topic, cmd, sem_id) from above
-# Use calc_crc2_ping(to_id, sem_id) for bus discovery
-```
+All frames below use SEM ID `0x7b`. CRC values are computed by `steca_crc.py`.
 
 ### Captured reference frames (SEM=`0x7b`, inverter ID `0x01`)
 ```python
-SG_VERSIONS      = bytes.fromhex("02010 00c017bc6200379 8c03".replace(" ",""))
-SG_NOMINAL_POWER = bytes.fromhex("02010010017bb540030001 1d723095 03".replace(" ",""))
-SG_PANEL_POWER   = bytes.fromhex("02010010017bb540030001 227712ee 03".replace(" ",""))
-SG_PANEL_VOLTAGE = bytes.fromhex("02010010017bb540030001 237878e4 03".replace(" ",""))
-SG_PANEL_CURRENT = bytes.fromhex("02010010017bb540030001 2479a0b6 03".replace(" ",""))
-SG_AC_POWER      = bytes.fromhex("02010010017bb540030001 297e985b 03".replace(" ",""))
-SG_DAILY_YIELD   = bytes.fromhex("02010010017bb540030001 3c91e1c9 03".replace(" ",""))
-SG_TIME          = bytes.fromhex("02010010017bb564030001 055a3a44 03".replace(" ",""))
-SG_SERIAL        = bytes.fromhex("02010010017bb564030001 095e856e 03".replace(" ",""))
-SG_TOTAL_YIELD   = bytes.fromhex("02010010017bb564030001 f146cc79 03".replace(" ",""))
+SG_VERSIONS      = bytes.fromhex("0201000c017bc62003798c03")
+SG_NOMINAL_POWER = bytes.fromhex("02010010017bb5400300011d72309503")
+SG_PANEL_POWER   = bytes.fromhex("02010010017bb540030001227712ee03")
+SG_PANEL_VOLTAGE = bytes.fromhex("02010010017bb540030001237878e403")
+SG_PANEL_CURRENT = bytes.fromhex("02010010017bb5400300012479a0b603")
+SG_AC_POWER      = bytes.fromhex("02010010017bb540030001297e985b03")
+SG_DAILY_YIELD   = bytes.fromhex("02010010017bb5400300013c91e1c903")
+SG_TIME          = bytes.fromhex("02010010017bb564030001055a3a4403")
+SG_SERIAL        = bytes.fromhex("02010010017bb564030001095e856e03")
+SG_TOTAL_YIELD   = bytes.fromhex("02010010017bb564030001f146cc7903")
 ```
 
 ---
@@ -210,7 +182,8 @@ pip3 install pyserial
 usage: getStecaGridData.py [-h] [-v] [-u] [-s SERIAL]
                            [-np] [-pp] [-pv] [-pc] [-ap]
                            [-dy] [-ty] [-ti] [-sn] [-ve]
-                           [-gm] [--discover] [--full-scan]
+                           [-gm] [-el] [--power-limit {0,1,2,3}]
+                           [--discover] [--full-scan]
 
 optional arguments:
   -ap  AC power (W)
@@ -224,9 +197,12 @@ optional arguments:
   -sn  Serial number
   -ve  Firmware versions
   -gm  Grid measurements (ENS1 + ENS2 voltage, frequency)
+  -el  Event log (both pages)
   -u   Show unit of measurement
   -s   Serial port (default /dev/ttyS0)
   -v   Verbose output
+  --power-limit {0,1,2,3}
+       Send power limit frame: 0=100%, 1=60%, 2=30%, 3=0% (experimental)
   --discover    Scan RS485 bus for inverters (quick: IDs 0x01..0x0a)
   --full-scan   Used with --discover: full scan IDs 0x01..0x65 (~3 min)
 ```
@@ -252,14 +228,14 @@ and the inverter. Uses a dedicated reader thread to avoid losing bytes from larg
 frames (e.g. event log responses, ~860 bytes).
 
 Features:
-- CRC1 and CRC2 verification using the solved models
+- CRC1 and CRC2 verification for all frame types (nibble-table, no exceptions)
 - Decodes all known topics including GridMeasurements and EventLog (both pages)
 - JSON log for offline analysis
 - Threaded UART reader (no frame loss at 38400 baud)
 
 ### Install
 ```bash
-pip3 install pyserial crcmod
+pip3 install pyserial
 ```
 
 ### Usage
@@ -273,7 +249,7 @@ python3 steca_sniffer.py --port /dev/ttyUSB0 --no-log    # suppress JSON log
 ```
 [00:06:27] RESPONSE  TO=0xc9 FROM=0x01  LEN=860  StecaUser-4.4
   Topic:   0x5a EventLog_p1
-  CRC1:0x01[✓]  CRC2:0x0024[?]  model=?
+  CRC1:0x01[✓]  CRC2:0x0024[✓]  model=nibble_crc16
   → event_log(p1): 74 total, 20 entries
   EventLog (74 total, 20 in this frame):
       1  2026-01-09 15:27:20  ENS Grid Voltage too low
@@ -313,9 +289,8 @@ HMI / PU / ENS2 — Net11
 ---
 
 ## Open Topics
-- **cmd=`0x34`/`0x35`** (12-byte frames seen immediately before event log requests): purpose unknown, CRC2 not yet modelled.
+- **cmd=`0x34`/`0x35`** (12-byte frames seen immediately before event log requests): purpose unknown, CRC2 not yet verified experimentally. `build_power_limit_frame(step)` in `getStecaGridData.py` sends `cmd=0x34` with `sub=step` as a hypothesis for power limiting — unverified.
 - **Write / control frames** (power limitation via StecaGrid SEM): not yet captured. Requires running StecaGrid User 4.4 with sniffer while activating feed-in management.
-- **SEM ID `0x7b` ping frames** beyond ID `0x01`: CRC2 offset constant (`0xb6db`), so `calc_crc2_ping(to_id, 0x7b)` works for any ID.
 
 ---
 
