@@ -373,28 +373,35 @@ def process_steca485(t):
     return results
 
 # ── Serial I/O ────────────────────────────────────────────────────────────────
-def getStecaGridResult(port, req, timeout_s=2.0):
-    """Send req, read response, return results[5] (the value field)."""
-    if DEBUG:
-        print("\nserial write:")
-        process_steca485(req)
-    port.reset_input_buffer()
-    port.write(req)
-    if DEBUG:
-        print("\nserial read:")
-    in_data = read_complete_frame(port, timeout_s=timeout_s)
-    if in_data is None:
+def getStecaGridResult(port, req, timeout_s=2.0, retries=3):
+    """Send req, read response, return results[5] (the value field).
+    Retries on error/busy responses from the inverter (shared bus)."""
+    for attempt in range(retries):
+        if DEBUG and attempt > 0:
+            print(f"# retry {attempt}")
+        port.reset_input_buffer()
+        port.write(req)
         if DEBUG:
-            print("# timeout — no complete frame received")
-        return None
-    results = process_steca485(in_data)
-    if DEBUG:
-        print(results)
-    if results and len(results) >= 6:
-        val = results[5]
-        if isinstance(val, list) and len(val) == 2 and val[1] == "NUL":
-            return None
-        return val
+            print("\nserial read:")
+        in_data = read_complete_frame(port, timeout_s=timeout_s)
+        if in_data is None:
+            if DEBUG:
+                print("# timeout — no complete frame received")
+            break  # no response at all — don't retry (wrong CRC2, device absent, …)
+        results = process_steca485(in_data)
+        if DEBUG:
+            print(results)
+        if results and len(results) >= 6:
+            val = results[5]
+            if isinstance(val, list) and len(val) == 2 and val[1] == "NUL":
+                return None
+            return val
+        # Valid frame received but no usable value (error/busy status byte).
+        # The inverter was mid-exchange with the SEM — wait and retry.
+        if attempt < retries - 1:
+            if DEBUG:
+                print("# error response, retrying…")
+            time.sleep(0.3)
     return None
 
 # ── Bus discovery ─────────────────────────────────────────────────────────────
