@@ -15,6 +15,14 @@ to communicate with StecaGrid inverters. Newer inverter models have an XML/HTTP 
 | Stop bits | 1 |
 | Connector | RJ45 (RS485 A/B/GND, **not** Ethernet) |
 
+### RS485 Addresses
+| Address | Device |
+|---------|--------|
+| `0x01`  | Inverter (default) |
+| `0x7b`  | SEM sender ID used by this tool |
+| `0xc9`  | StecaGrid User 4.4 (SEM software) |
+| `0x65`  | StecaGrid SEM energy manager hardware |
+
 ### Frame Structure
 ```
 [02] [01] [00] [LEN] [TO] [FROM] [CRC1] [payload...] [CRC2_HI] [CRC2_LO] [03]
@@ -22,51 +30,131 @@ to communicate with StecaGrid inverters. Newer inverter models have an XML/HTTP 
 
 LEN = total frame length including STX (0x02) and ETX (0x03)
 ```
-- **STX** `0x02`, **ETX** `0x03`  
-- **LEN** big-endian uint16 at bytes [2:4] = total frame length  
-- **TO / FROM** RS485 device IDs (inverter = `0x01`, SEM = `0x7b` or `0xc9`)  
-- **CRC1** covers bytes `[0:6]` — see [CRC section](#crc)  
-- **CRC2** is the last 2 bytes before ETX — see [CRC section](#crc)  
-- **Payload** starts at byte 7; first byte = command, byte 5 = topic
+- **STX** `0x02`, **ETX** `0x03`
+- **LEN** big-endian uint16 at bytes [2:4] = total frame length
+- **TO / FROM** RS485 device IDs
+- **CRC1** covers bytes `[0:6]` — see [CRC section](#crc)
+- **CRC2** is the last 2 bytes before ETX — see [CRC section](#crc)
+- **Payload** starts at byte 7: `[cmd, auth, dlen_hi, dlen_lo, topic, data..., chk]`
+  - `auth` = authorization level byte (`0x03` = Administrator)
+  - `dlen` = length of `[topic, data...]` before `chk`
+  - `chk` = `(0x55 + sum([topic, data...])) & 0xFF`
 
-### Command Bytes
-| Direction | Cmd | Meaning |
-|-----------|-----|---------|
-| Request  | `0x20` | Ping / bus discovery |
-| Request  | `0x34` | Unknown (seen before event log requests) |
-| Request  | `0x40` | Request type A (measurement values) |
-| Request  | `0x54` | Request type D |
-| Request  | `0x60` | Request type E |
-| Request  | `0x64` | Request type B (yield, time, serial) |
-| Request  | `0x68` | Request type C (event log, serial detail) |
-| Response | `0x21` | Versions response |
-| Response | `0x35` | Unknown response to `0x34` |
-| Response | `0x41` | Response type A |
-| Response | `0x55` | Response type D |
-| Response | `0x61` | Response type E |
-| Response | `0x65` | Response type B |
-| Response | `0x69` | Response type C |
+### Service Code Table
+| Request | Name                  | Response |
+|---------|-----------------------|----------|
+| `0x11`  | Reset                 | —        |
+| `0x20`  | ReadIdentification    | `0x21`   |
+| `0x22`  | ReadDiagnosticServices| `0x23`   |
+| `0x30`  | ReadErrorBuffer       | `0x31`   |
+| `0x32`  | ReadErrorBufferEnvData| `0x33`   |
+| `0x34`  | ClearErrorBuffer      | `0x35`   |
+| `0x40`  | ReadDataById          | `0x41`   |
+| `0x50`  | WriteDataById         | `0x51`   |
+| `0x54`  | GetDataById           | `0x55`   |
+| `0x60`  | DownloadById          | `0x61`   |
+| `0x64`  | UploadById            | `0x65`   |
+| `0x68`  | UploadInternById      | `0x69`   |
+| `0x70`  | BootloaderConnect     | `0x71`   |
 
-### Known Topics
-| Topic | Name | Cmd | Unit / Format |
-|-------|------|-----|---------------|
-| `0x05` | Time | `0x64` / `0x65` | `YY MM DD HH MM SS` (year offset 2000) |
-| `0x08` | Mystery_08 | `0x64` / `0x65` | Internal counter / state (unknown) |
-| `0x09` | Serial | `0x68` / `0x69` | ASCII string + sub-topic manifest |
-| `0x1d` | NominalPower | `0x40` / `0x41` | Steca float, W |
-| `0x20` | Versions | `0x20` / `0x21` | Firmware version strings |
-| `0x22` | PanelPower | `0x40` / `0x41` | Steca float, W |
-| `0x23` | PanelVoltage | `0x40` / `0x41` | Steca float, V |
-| `0x24` | PanelCurrent | `0x40` / `0x41` | Steca float, A |
-| `0x29` | ACPower | `0x40` / `0x41` | Steca float, W |
-| `0x3c` | DailyYield | `0x40` / `0x41` | Steca float, Wh |
-| `0x51` | GridMeasurements | `0x40` / `0x41` | ENS1+ENS2 label + 4× Steca float |
-| `0x5a` | EventLog page 1 | `0x68` / `0x69` | Event entries (large frame, ~860 B) |
-| `0x5b` | EventLog page 2 | `0x68` / `0x69` | Event entries (recent / oldest) |
-| `0xf1` | TotalYield | `0x64` / `0x65` | IEEE 754 float LE, Wh |
+### Authorization Levels
+`0`=User, `1`=Service, `2`=Development, `3`=Administrator.
+The software operates at Administrator level by default.
 
-### Data Encoding
-**Steca proprietary float** (4 bytes: `[unit] [b1] [b2] [b3]`):
+---
+
+## Topic Map
+
+### Inverter reads (TO=`0x01`)
+| Topic  | Service       | Content                                      |
+|--------|---------------|----------------------------------------------|
+| `0x05` | Upload (R/W)  | Time (`YY MM DD HH MM SS`, year offset 2000) |
+| `0x08` | Upload        | Bootup timestamp (ms since boot, BE uint32)  |
+| `0x09` | UploadIntern  | Serial number (ASCII)                        |
+| `0x1d` | Read          | Nominal power                                |
+| `0x22` | Read          | Panel power (DC)                             |
+| `0x23` | Read          | Panel voltage (DC)                           |
+| `0x24` | Read          | Panel current (DC)                           |
+| `0x29` | Read          | AC power                                     |
+| `0x32` | Get           | Country code                                 |
+| `0x33` | Get           | Country code list                            |
+| `0x3c` | Read          | Daily yield                                  |
+| `0x51` | Read          | Grid measurements ENS1+ENS2                 |
+| `0x52` | Read          | Grid measurements L2                         |
+| `0x53` | Read          | Grid measurements L3                         |
+| `0x5a` | UploadIntern  | Event log page 1 (~860 B, up to 20 entries)  |
+| `0x5b` | UploadIntern  | Event log page 2 (most recent entries)       |
+| `0xef` | Upload        | All yearly yields (float array)              |
+| `0xf1` | Upload (R/W)  | Total yield (IEEE 754 LE float, Wh)          |
+
+### Historical yield — all UploadById (`0x64`), TO=`0x01`
+Index 0 = most recent period, index N = N periods ago.
+
+| Series       | Count | Topic IDs | Index 0 |
+|--------------|-------|-----------|---------|
+| DayCurves    | 31    | `0x7b, 0x75, 0x6f, 0x69, 0x63, 0x5d, 0x57,` then `0x93`..`0x7c` | today |
+| DayValues    | 13    | `0xbf, 0xbd, 0xbb, 0xb9, 0xb7, 0xb5, 0xb3, 0xb1, 0xaf, 0xad, 0xab, 0xa9, 0xa8` | this month |
+| MonthValues  | 20    | `0xe0`..`0xcd` (descending) | this year |
+| YearValues   | 1     | `0xef` | all years |
+
+### SEM reads/writes (TO=`0x65`)
+| Topic  | Service       | Content                          |
+|--------|---------------|----------------------------------|
+| `0x0a` | Upload (R/W)  | EnergyManager config (~87 bytes) |
+| `0x0b` | Upload        | Relais history                   |
+| `0x0d` | Upload        | EnergyManager live measurements  |
+
+---
+
+## Write Operations
+
+### Direct to inverter (TO=`0x01`)
+| Cmd    | Topic  | Data                     | Effect                     |
+|--------|--------|--------------------------|----------------------------|
+| `0x11` | —      | (no payload)             | Reset inverter             |
+| `0x50` | `0x01` | `uint32 = 0x55555555`    | Factory reset ⚠️           |
+| `0x50` | `0x0b` | `uint32 = countryCode`   | Set country code           |
+| `0x50` | `0x0b` | `uint32 = 0xFFFF`        | Delete country code        |
+| `0x50` | `0xff` | `uint32 = newAddr`       | Set inverter RS485 address |
+| `0x60` | `0x05` | `[YY MM DD HH MM SS]`    | Set time                   |
+| `0x60` | `0xf1` | `float32_LE × 1000`      | Set total yield            |
+
+### To SEM (TO=`0x65`)
+| Cmd    | Topic  | Data                | Effect                  |
+|--------|--------|---------------------|-------------------------|
+| `0x60` | `0x0a` | 87-byte EM payload  | Set EnergyManager config |
+
+### EnergyManager payload structure (87 bytes, big-endian)
+```
+[0]     uint8:  payload_version (= 0)
+[1-2]   int16:  S0PulsesPerkWh
+[3]     uint8:  DeratingMode  (0=Off, 1=RippleControl, 2=PowerLimit, 3=EasyBox)
+[4-35]  16×int16: DeratingPatterns[16]  (-1 = disabled)
+[36-39] uint32: NominalPowerW
+[40-43] uint32: DeratingPowerLimitW       ← power limit in watts
+[44-45] uint16: PID Kp
+[46-47] uint16: PID Ki
+[48-49] uint16: PID Kd
+[50-51] uint16: PeriodeMin_s
+[52-53] uint16: PeriodeMax_s
+[54-55] uint16: Limit_Permill
+[56]    uint8:  RelaisMode  (0=Off, 1=InputPattern, 2=MinPower, 3=MinPower_SmartGrid)
+[57-58] uint16: RelaisPatterns bitfield
+[59-62] uint32: Activation.ThresholdPower_W
+[63-66] uint32: Deactivation.ThresholdPower_W
+[67-68] uint16: Activation.ThresholdDerating_Permille
+[69-70] uint16: Deactivation.ThresholdDerating_Permille
+[71-74] uint32: Activation.Latency_s
+[75-78] uint32: Deactivation.Latency_s
+[79-82] uint32: Activation.HoldTime_s
+[83-86] uint32: Deactivation.HoldTime_s
+```
+
+---
+
+## Data Encoding
+
+**Steca proprietary float** (4 bytes: `[unit, b1, b2, b3]`):
 ```python
 iacpower = ((b3 << 8 | b1) << 8 | b2) << 7
 value, = struct.unpack('f', struct.pack('I', iacpower & 0xFFFFFFFF))
@@ -79,14 +167,15 @@ bits = b[3]<<24 | b[2]<<16 | b[1]<<8 | b[0]
 value, = struct.unpack('f', struct.pack('I', bits))
 ```
 
-**Event log entries** contain null-terminated ASCII strings preceded by two 6-byte
-timestamps (`YY MM DD HH MM SS`, year offset 2000).  
-The first byte of the payload data is the total event count (ring buffer).  
-Topic `0x5a` = bulk history (~20 entries, large frame); topic `0x5b` = most recent entries.
+**Bootup Timestamp** (topic `0x08`, Upload response):
+```python
+ms = struct.unpack('>I', payload[5:9])[0]   # BE uint32 milliseconds
+boot_time = datetime.now() - timedelta(milliseconds=ms)
+```
 
-### Bus Discovery / Ping
-The SEM scans all 101 RS485 IDs (`0x01`..`0x65`) using 12-byte ping frames (cmd `0x20`).
-Only responding devices are queried further. On a single-inverter system, only ID `0x01` responds.
+**Event log entries** contain null-terminated ASCII strings preceded by 6-byte
+timestamps (`YY MM DD HH MM SS`, year offset 2000).
+The first byte of the payload data is the total event count (ring buffer).
 
 ---
 
@@ -123,7 +212,7 @@ def crc16_nibble(data: bytes, init: int = 0x5555) -> int:
 
 def build_frame(to: int, frm: int, payload: bytes) -> bytes:
     total_len = len(payload) + 10
-    header = bytes([0x02, 0x01, 0x00, total_len, to, frm])
+    header = bytes([0x02, 0x01, total_len >> 8, total_len & 0xFF, to, frm])
     c1     = crc8_nibble(header)
     body   = header + bytes([c1]) + payload
     c2     = crc16_nibble(body + b'\x03')
@@ -134,25 +223,20 @@ def build_frame(to: int, frm: int, payload: bytes) -> bytes:
 ```python
 crc1 = crc8_nibble(frame[0:6], init=0x55)
 ```
-Covers frame bytes `[0:6]` (STX through FROM byte).
-Verified against all known frames.
+Covers frame bytes `[0:6]` (STX through FROM). Verified against all known frames.
 
 ### CRC2 — **Fully solved** ✓
 ```python
 crc2 = crc16_nibble(frame[:-3] + b'\x03', init=0x5555)
 ```
-Covers the entire frame **excluding** the two CRC2 bytes,
-**including** the ETX byte `0x03`.
-
-Verified against all known frame types: ping, read (`0x40`/`0x64`/`0x68`), write (`0x34`), responses.
+Covers the entire frame **excluding** the two CRC2 bytes, **including** ETX.
+Verified against all known frame types: ping, read (`0x40`/`0x64`/`0x68`), write
+(`0x34`/`0x50`/`0x60`), and responses.
 
 ---
 
-## Request Frames
+## Captured Reference Frames (SEM=`0x7b`, inverter ID `0x01`)
 
-All frames below use SEM ID `0x7b`. CRC values are computed by `steca_crc.py`.
-
-### Captured reference frames (SEM=`0x7b`, inverter ID `0x01`)
 ```python
 SG_VERSIONS      = bytes.fromhex("0201000c017bc62003798c03")
 SG_NOMINAL_POWER = bytes.fromhex("02010010017bb5400300011d72309503")
@@ -169,8 +253,7 @@ SG_TOTAL_YIELD   = bytes.fromhex("02010010017bb564030001f146cc7903")
 ---
 
 ## getStecaGridData.py
-Reads inverter data via RS485 and prints the result. Supports all known topics.
-Includes bus discovery using synthesized ping frames.
+Reads/writes inverter data via RS485. All frames synthesized from `steca_crc.py`.
 
 ### Install
 ```bash
@@ -179,44 +262,63 @@ pip3 install pyserial
 
 ### Usage
 ```
-usage: getStecaGridData.py [-h] [-v] [-u] [-s SERIAL]
-                           [-np] [-pp] [-pv] [-pc] [-ap]
+usage: getStecaGridData.py [-h] [-v] [-u] [-s SERIAL] [--id ID]
+                           [-np] [-pp] [-pv] [-pc] [-ap] [-gm] [-el]
                            [-dy] [-ty] [-ti] [-sn] [-ve]
-                           [-gm] [-el] [--power-limit {0,1,2,3}]
+                           [--bootup-timestamp]
+                           [--day-curve [N]] [--day-values [N]]
+                           [--month-values [N]] [--year-values]
                            [--discover] [--full-scan]
+                           [--set-power-limit WATTS]
 
-optional arguments:
-  -ap  AC power (W)
-  -dy  Daily yield (Wh)
-  -ty  Total yield (Wh)
-  -pp  Panel power (W)
-  -pv  Panel voltage (V)
-  -pc  Panel current (A)
-  -np  Nominal power (W)
-  -ti  Inverter time
-  -sn  Serial number
-  -ve  Firmware versions
-  -gm  Grid measurements (ENS1 + ENS2 voltage, frequency)
-  -el  Event log (both pages)
-  -u   Show unit of measurement
-  -s   Serial port (default /dev/ttyS0)
-  -v   Verbose output
-  --power-limit {0,1,2,3}
-       Send power limit frame: 0=100%, 1=60%, 2=30%, 3=0% (experimental)
-  --discover    Scan RS485 bus for inverters (quick: IDs 0x01..0x0a)
-  --full-scan   Used with --discover: full scan IDs 0x01..0x65 (~3 min)
+Read options:
+  -ap   AC power (W)
+  -dy   Daily yield (Wh)
+  -ty   Total yield (Wh)
+  -pp   Panel power (W)
+  -pv   Panel voltage (V)
+  -pc   Panel current (A)
+  -np   Nominal power (W)
+  -ti   Inverter time
+  -sn   Serial number
+  -ve   Firmware versions
+  -gm   Grid measurements (ENS1 + ENS2)
+  -el   Event log (both pages)
+  --bootup-timestamp   Inverter boot time (topic 0x08)
+
+Historical yield (UploadById, index 0 = most recent):
+  --day-curve [N]    Day power curve (0=today, max 30)
+  --day-values [N]   Daily yield totals for month (0=this month, max 12)
+  --month-values [N] Monthly yield totals for year (0=this year, max 19)
+  --year-values      All yearly yield totals
+
+Discovery:
+  --discover    Scan RS485 bus (IDs 0x01..0x0a)
+  --full-scan   With --discover: scan 0x01..0x65
+
+Write / control:
+  --set-power-limit WATTS
+      Read EnergyManager config from SEM (0x65), set DeratingMode=PowerLimit
+      and DeratingPowerLimitW=WATTS, write back. Requires SEM connected.
 ```
 
-### Example
+### Examples
 ```bash
 $ python3 getStecaGridData.py -ty -u
 52978840.0 Wh
+
+$ python3 getStecaGridData.py --bootup-timestamp
+Boot time: 2026-05-13 05:30:12  (24048000 ms uptime)
+
+$ python3 getStecaGridData.py --set-power-limit 2000
+Reading EnergyManager config from SEM (0x65)...
+Writing power limit 2000 W to SEM...
+SEM response: 02 01 ...
 
 $ python3 getStecaGridData.py --discover --full-scan
 StecaGrid RS485 Bus Discovery
   Scanning: 101 IDs (0x01..0x65)
   0x01  ✓ found  Serial: XXXXXXXXXXXXXXXXXXXX
-  ...
 Result: 1 inverter(s) on bus.
 ```
 
@@ -224,12 +326,13 @@ Result: 1 inverter(s) on bus.
 
 ## steca_sniffer.py
 Passive RS485 bus sniffer. Monitors all traffic between StecaGrid User software
-and the inverter. Uses a dedicated reader thread to avoid losing bytes from large
-frames (e.g. event log responses, ~860 bytes).
+and the inverter.
 
 Features:
-- CRC1 and CRC2 verification for all frame types (nibble-table, no exceptions)
-- Decodes all known topics including GridMeasurements and EventLog (both pages)
+- CRC1 and CRC2 verification for all frame types (nibble-table)
+- Decodes all known read responses including GridMeasurements, EventLog, BootupTimestamp
+- Decodes write operations: `0x50` WriteDataById, `0x60` DownloadById (SetTime, EMConfig)
+- Decodes EnergyManager config reads/writes (SEM address `0x65`)
 - JSON log for offline analysis
 - Threaded UART reader (no frame loss at 38400 baud)
 
@@ -241,8 +344,8 @@ pip3 install pyserial
 ### Usage
 ```bash
 python3 steca_sniffer.py --port /dev/ttyUSB0
-python3 steca_sniffer.py --port /dev/ttyUSB0 --verbose   # + raw hex + assembler debug
-python3 steca_sniffer.py --port /dev/ttyUSB0 --no-log    # suppress JSON log
+python3 steca_sniffer.py --port /dev/ttyUSB0 --verbose
+python3 steca_sniffer.py --port /dev/ttyUSB0 --no-log
 ```
 
 ### Example output
@@ -251,12 +354,11 @@ python3 steca_sniffer.py --port /dev/ttyUSB0 --no-log    # suppress JSON log
   Topic:   0x5a EventLog_p1
   CRC1:0x01[✓]  CRC2:0x0024[✓]  model=nibble_crc16
   → event_log(p1): 74 total, 20 entries
-  EventLog (74 total, 20 in this frame):
-      1  2026-01-09 15:27:20  ENS Grid Voltage too low
-      2  2024-11-13 21:26:09  ENS Grid Frequency too low
-      3  2024-06-14 09:10:30  ENS Grid Frequency too low
-     ...
-     20  2013-12-23 11:02:00  ENS Grid Frequency too low
+
+[00:07:01] →SEM  TO=0x65 FROM=0x7b  LEN=103  SEM-7b
+  Topic:   0x0a EMConfig
+  CRC1:0xe3[✓]  CRC2:0x1a2b[✓]  model=nibble_crc16
+  → SetEMConfig mode=PowerLimit(2) limit=2000W nominal=3600W
 ```
 
 ---
@@ -289,8 +391,10 @@ HMI / PU / ENS2 — Net11
 ---
 
 ## Open Topics
-- **cmd=`0x34`/`0x35`** (12-byte frames seen immediately before event log requests): purpose unknown, CRC2 not yet verified experimentally. `build_power_limit_frame(step)` in `getStecaGridData.py` sends `cmd=0x34` with `sub=step` as a hypothesis for power limiting — unverified.
-- **Write / control frames** (power limitation via StecaGrid SEM): not yet captured. Requires running StecaGrid User 4.4 with sniffer while activating feed-in management.
+- **EnergyManager payload endianness**: assumed big-endian; unverified without a live SEM capture.
+- **Historical yield data format**: topic IDs are known; exact float encoding per series unverified.
+- **SEM live measurements** (topic `0x0d`): structure unknown.
+- **Write / control frames**: `--set-power-limit` requires a connected SEM and is untested on hardware.
 
 ---
 

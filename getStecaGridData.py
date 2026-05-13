@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-getStecaGridData.py — Read data via RS485 from StecaGrid 3600
+getStecaGridData.py — Read/write data via RS485 from StecaGrid 3600
 
-CRC1 and CRC2 are computed by steca_crc.py (nibble-table algorithms).
+CRC1 and CRC2 computed by steca_crc.py (nibble-table algorithms).
 Use --discover / --full-scan to find inverters, then query by --id.
 """
 
@@ -23,11 +23,13 @@ SERIAL_SBIT     = serial.STOPBITS_ONE
 SERIAL_BAUDRATE = 38400
 SERIAL_TIMEOUT  = 1
 
-SEM_ID = 0x7b
+SEM_ID   = 0x7b   # our RS485 sender address
+SEM_ADDR = 0x65   # RS485 address of the StecaGrid SEM energy manager
 
 # ── Topic registry ────────────────────────────────────────────────────────────
 # name → (topic_byte, cmd_byte)
 TOPICS = {
+    # Inverter reads (TO=0x01)
     "nominal_power": (0x1d, 0x40),
     "panel_power":   (0x22, 0x40),
     "panel_voltage": (0x23, 0x40),
@@ -35,13 +37,27 @@ TOPICS = {
     "ac_power":      (0x29, 0x40),
     "daily_yield":   (0x3c, 0x40),
     "grid_meas":     (0x51, 0x40),
+    "grid_meas_l2":  (0x52, 0x40),
+    "grid_meas_l3":  (0x53, 0x40),
     "event_log_p1":  (0x5a, 0x68),
     "event_log_p2":  (0x5b, 0x68),
     "time":          (0x05, 0x64),
-    "mystery_08":    (0x08, 0x64),
+    "bootup_ts":     (0x08, 0x64),
     "serial":        (0x09, 0x64),
     "total_yield":   (0xf1, 0x64),
+    # SEM reads (use with to_id=SEM_ADDR)
+    "em_config":     (0x0a, 0x64),
+    "em_live":       (0x0d, 0x64),
 }
+
+# ── Historical yield topic IDs (UploadById cmd=0x64, TO=0x01) ─────────────────
+# Index 0 = most recent, index N = N periods ago
+_DAY_CURVE_TOPICS   = (0x7b, 0x75, 0x6f, 0x69, 0x63, 0x5d, 0x57,
+                       *range(0x93, 0x7b, -1))          # 31: today → −30 days
+_DAY_VALUE_TOPICS   = (0xbf, 0xbd, 0xbb, 0xb9, 0xb7, 0xb5, 0xb3,
+                       0xb1, 0xaf, 0xad, 0xab, 0xa9, 0xa8)  # 13: this month → −12
+_MONTH_VALUE_TOPICS = tuple(range(0xe0, 0xcc, -1))     # 20: this year → −19
+_YEAR_VALUE_TOPIC   = 0xef                              # all years as float array
 
 # ── Frame builders ────────────────────────────────────────────────────────────
 def build_ping(to_id: int, sem_id: int = SEM_ID) -> bytes:
@@ -51,19 +67,60 @@ def build_ping(to_id: int, sem_id: int = SEM_ID) -> bytes:
 
 def build_request(to_id: int, topic: int, cmd: int,
                   sem_id: int = SEM_ID) -> bytes:
-    """16-byte data-request frame for any (topic, cmd) pair."""
+    """16-byte read-request frame."""
     chk = (topic + 0x55) & 0xFF
     return build_frame(to_id, sem_id, bytes([cmd, 0x03, 0x00, 0x01, topic, chk]))
 
 
-def build_power_limit_frame(step: int) -> bytes:
-    """Power-limit control frame (cmd=0x34, hypothesis: step=0→100%, 1→60%, 2→30%, 3→0%).
-    Unverified — send and inspect the inverter response experimentally."""
-    return build_frame(0x01, SEM_ID, bytes([0x34, step & 0xFF]))
+def build_write(to_id: int, topic: int, cmd: int,
+                data: bytes, sem_id: int = SEM_ID) -> bytes:
+    """Variable-length write-request frame (cmd=0x50/0x60).
+
+    DataFrame = [topic] + data; chk = (0x55 + sum(DataFrame)) & 0xFF.
+    """
+    df  = bytes([topic]) + data
+    chk = (0x55 + sum(df)) & 0xFF
+    payload = bytes([cmd, 0x03, len(df) >> 8, len(df) & 0xFF]) + df + bytes([chk])
+    return build_frame(to_id, sem_id, payload)
 
 
 # Pre-computed ping frames for all RS485 IDs (avoids per-scan alloc)
 PING_FRAMES = {i: build_ping(i) for i in range(1, 0x66)}
+
+
+def build_set_time(dt: datetime.datetime, inv_id: int = 0x01,
+                   sem_id: int = SEM_ID) -> bytes:
+    """SetDateTime frame (cmd=0x60 DownloadById, topic=0x05)."""
+    return build_write(inv_id, 0x05, 0x60,
+                       bytes([dt.year - 2000, dt.month, dt.day,
+                               dt.hour, dt.minute, dt.second]),
+                       sem_id)
+
+
+def build_energy_manager_payload(derating_mode: int,
+                                  power_limit_w: int,
+                                  nominal_power_w: int) -> bytes:
+    """Build 87-byte EnergyManager config payload for write to SEM (topic=0x0a).
+
+    derating_mode: 0=Off, 1=RippleControl, 2=PowerLimit, 3=EasyBox
+    Unused fields default to zero / disabled.
+    """
+    buf = bytearray(87)
+    # [0]    payload_version = 0 (implicit)
+    # [1-2]  S0PulsesPerkWh = 1000
+    struct.pack_into('>h', buf, 1, 1000)
+    # [3]    DeratingMode
+    buf[3] = derating_mode & 0xFF
+    # [4-35] DeratingPatterns[16] = -1 (disabled)
+    for i in range(16):
+        struct.pack_into('>h', buf, 4 + i * 2, -1)
+    # [36-39] NominalPowerW
+    struct.pack_into('>I', buf, 36, nominal_power_w)
+    # [40-43] DeratingPowerLimitW
+    struct.pack_into('>I', buf, 40, power_limit_w)
+    # [54-55] Limit_Permill = 1000 (= 100.0 %)
+    struct.pack_into('>H', buf, 54, 1000)
+    return bytes(buf)
 
 # ── Value decoders ────────────────────────────────────────────────────────────
 def decode_stecaFloat_a(ac_bytes):
@@ -85,7 +142,7 @@ def decode_TotalYield_a(ba):
 
 
 def decode_grid_meas(t):
-    """Decode GridMeasurements response (topic=0x51, ResponseA).
+    """Decode GridMeasurements response (topic=0x51).
     Returns [(label, [val, ...]), (label, [val, ...])] for ENS1 and ENS2."""
     try:
         label_a_len = (t[13] << 8) | t[14]
@@ -103,8 +160,31 @@ def decode_grid_meas(t):
         return []
 
 
+def decode_em_config(raw: bytes) -> dict:
+    """Parse 87-byte EnergyManager config payload (assumed big-endian)."""
+    if len(raw) < 87:
+        return {"error": f"too short ({len(raw)} bytes)"}
+    mode_names = {0: "Off", 1: "RippleControl", 2: "PowerLimit", 3: "EasyBox"}
+    mode = raw[3]
+    patterns = [struct.unpack_from('>h', raw, 4 + i*2)[0] for i in range(16)]
+    return {
+        "payload_version":      raw[0],
+        "S0PulsesPerkWh":       struct.unpack_from('>h', raw, 1)[0],
+        "DeratingMode":         f"{mode} ({mode_names.get(mode, '?')})",
+        "DeratingPatterns":     patterns,
+        "NominalPowerW":        struct.unpack_from('>I', raw, 36)[0],
+        "DeratingPowerLimitW":  struct.unpack_from('>I', raw, 40)[0],
+        "PID_Kp":               struct.unpack_from('>H', raw, 44)[0],
+        "PID_Ki":               struct.unpack_from('>H', raw, 46)[0],
+        "PID_Kd":               struct.unpack_from('>H', raw, 48)[0],
+        "PeriodeMin_s":         struct.unpack_from('>H', raw, 50)[0],
+        "PeriodeMax_s":         struct.unpack_from('>H', raw, 52)[0],
+        "Limit_Permill":        struct.unpack_from('>H', raw, 54)[0],
+        "RelaisMode":           raw[56],
+    }
+
+
 def _try_ts(data, pos):
-    """Try to parse a 6-byte YY MM DD HH MM SS timestamp at data[pos]."""
     if pos + 6 > len(data):
         return None
     b = data[pos:pos + 6]
@@ -118,8 +198,7 @@ def _try_ts(data, pos):
 
 
 def decode_event_log(payload: bytes):
-    """Decode a ResponseC event log payload (payload[0] must be 0x69).
-    Returns (total_events, [(datetime_or_None, message_str), ...])."""
+    """Decode a ResponseC event log payload (payload[0] must be 0x69)."""
     if len(payload) < 7 or payload[0] != 0x69:
         return 0, []
     data  = payload[6:]
@@ -199,8 +278,7 @@ def is_one_full_telegram(t):
 
 
 def read_complete_frame(port, timeout_s=2.0):
-    """Read bytes from port until a complete, valid Steca frame is assembled.
-    Handles partial reads and bus noise; returns bytes or None on timeout."""
+    """Read bytes from port until a complete, valid Steca frame is assembled."""
     buf      = bytearray()
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
@@ -231,7 +309,7 @@ def read_complete_frame(port, timeout_s=2.0):
 
 # ── Frame parser ──────────────────────────────────────────────────────────────
 def process_steca485(t):
-    """Parse a response telegram. Returns a list: [to, from, cmd, topic, label, value]."""
+    """Parse a response telegram. Returns [to, from, cmd, topic, label, value]."""
     if not is_one_full_telegram(t):
         if DEBUG:
             print("# NOT a single full Steca485 Telegram")
@@ -242,87 +320,64 @@ def process_steca485(t):
 
     if DEBUG:
         print("#", format_hex_bytes(t))
-        print("# dgram:", end="  ")
-        print(f"to:{t[4]}  from:{t[5]}  len:{total_length}", end="  ")
-        print(f"crc1:{t[6]:02x}  crc2:{t[-3]:02x}{t[-2]:02x}")
+        print(f"# to:{t[4]}  from:{t[5]}  len:{total_length}  "
+              f"crc1:{t[6]:02x}  crc2:{t[-3]:02x}{t[-2]:02x}")
         print("# payload:", format_hex_bytes(t[7:-3]), " ", format_printable(t[7:-3]))
 
-    if t[7] == 0x40:    # RequestA
-        if DEBUG:
-            topics = {0x1d:"Nominal Power", 0x22:"Panel Power", 0x23:"Panel Voltage",
-                      0x24:"Panel Current", 0x29:"ACPower", 0x3c:"Daily Yield",
-                      0x51:"Grid Measurements"}
-            print(f"# RequestA for 0x{t[11]:02x} ({topics.get(t[11], '?')}) from {t[4]}")
-
-    elif t[7] == 0x41:  # ResponseA
+    if t[7] == 0x41:  # ResponseA (ReadDataById)
         if t[8] == 0x00:
-            dlen = (t[9] << 8 | t[10])
-            if DEBUG:
-                print(f"# ResponseA for 0x{t[11]:02x} from {t[4]} len={dlen}")
             if t[11] == 0x51:
                 groups = decode_grid_meas(t)
                 results += ["Grid Measurements", groups]
-                if DEBUG:
-                    for label, vals in groups:
-                        print(f"#  {label}:", ", ".join(f"{v[0]:.2f} {v[1]}" for v in vals))
             elif t[11] == 0x3c:
                 val = decode_stecaFloat_a(t[12:16])
                 results += ["Daily Yield", val]
-                if DEBUG:
-                    print(f"# Daily Yield {val[0]} {val[1]}")
             else:
                 label = t[15:15 + t[14]].decode("ascii", errors="replace")
                 val   = decode_stecaFloat_a(t[15 + t[14] : 15 + t[14] + 5])
                 results += [label, val]
-                if DEBUG:
-                    print(f"# {label} {val[0]} {val[1]}")
 
-    elif t[7] == 0x64:  # RequestB
-        if DEBUG:
-            topics = {0x05:"Time", 0x08:"Mystery_08", 0x09:"Serial", 0xf1:"Total Yield"}
-            print(f"# RequestB for 0x{t[11]:02x} ({topics.get(t[11], '?')}) from {t[4]}")
+    elif t[7] == 0x51:  # WriteDataById ACK
+        results += ["WriteAck-51", [f"topic=0x{t[11]:02x}", ""]]
 
-    elif t[7] == 0x65:  # ResponseB
-        if DEBUG:
-            print(f"# ResponseB for 0x{t[11]:02x} from {t[4]}")
+    elif t[7] == 0x61:  # DownloadById ACK
+        results += ["WriteAck-61", [f"topic=0x{t[11]:02x} status=0x{t[8]:02x}", ""]]
+
+    elif t[7] == 0x65:  # ResponseB (UploadById)
         if t[11] == 0xf1:
             val = decode_TotalYield_a(t[12:16])
             results += ["Total Yield", val]
-            if DEBUG:
-                print("#", val)
         elif t[11] == 0x05:
             dt = datetime.datetime(2000 + t[12], t[13], t[14], t[15], t[16], t[17])
             results += ["Time", [dt, ""]]
-            if DEBUG:
-                print(f"# {dt}")
         elif t[11] == 0x08:
-            results += ["???", [format_hex_bytes(t[12:17]), ""]]
-            if DEBUG:
-                print("#", format_hex_bytes(t[12:17]))
+            # Bootup timestamp: BE uint32 milliseconds since last inverter reboot
+            if len(t) >= 16:
+                ms = struct.unpack('>I', t[12:16])[0]
+                boot_time = datetime.datetime.now() - datetime.timedelta(milliseconds=ms)
+                results += ["BootupTimestamp", [boot_time, f"{ms} ms uptime"]]
+            else:
+                results += ["BootupTimestamp", [format_hex_bytes(t[12:16]), ""]]
         elif t[11] == 0x09:
             serial_str = t[12:-4].rstrip(b'\x00\x9f').decode("latin-1", errors="replace")
             results += ["Serial Number", [serial_str, ""]]
-            if DEBUG:
-                print(f"# {serial_str}")
+        elif t[11] == 0x0a:
+            # EnergyManager config (from SEM)
+            results += ["EMConfig", t[12:-4]]
         else:
-            results += ["???", [format_hex_bytes(t[12:17]), ""]]
+            results += ["???", [format_hex_bytes(t[12:min(12+16, len(t)-4)]), ""]]
 
-    elif t[7] == 0x69:  # ResponseC (event log)
+    elif t[7] == 0x69:  # ResponseC (UploadInternById — event log)
         if t[11] in (0x5a, 0x5b):
             page = "p1" if t[11] == 0x5a else "p2"
             total_ev, events = decode_event_log(t[7:-3])
             results += [f"EventLog-{page}", (total_ev, events)]
-            if DEBUG:
-                print(f"# EventLog-{page}: {total_ev} total, {len(events)} entries")
 
-    elif t[7] == 0x21:  # Versions response
+    elif t[7] == 0x21:  # ReadIdentification response
         if t[8] == 0x00:
-            dlen = (t[9] << 8 | t[10])
-            ver  = decode_version(t[11:-3])
+            ver = decode_version(t[11:-3])
             results += ["Versions", [ver, ""]]
             print()
-            if DEBUG:
-                print(f"# VersionsResponse from {t[4]} len={dlen}")
 
     return results
 
@@ -335,12 +390,10 @@ def getStecaGridResult(port, req, timeout_s=2.0, retries=3):
             print(f"# retry {attempt}")
         port.reset_input_buffer()
         port.write(req)
-        if DEBUG:
-            print("\nserial read:")
         in_data = read_complete_frame(port, timeout_s=timeout_s)
         if in_data is None:
             if DEBUG:
-                print("# timeout — no complete frame received")
+                print("# timeout")
             break
         results = process_steca485(in_data)
         if DEBUG:
@@ -351,10 +404,34 @@ def getStecaGridResult(port, req, timeout_s=2.0, retries=3):
                 return None
             return val
         if attempt < retries - 1:
-            if DEBUG:
-                print("# error response, retrying…")
             time.sleep(0.3)
     return None
+
+# ── Historical yield helpers ──────────────────────────────────────────────────
+def read_day_curve(port, day_offset: int = 0, inv_id: int = 0x01):
+    """Power curve for a day. day_offset=0 → today, 1 → yesterday, …, 30."""
+    if not 0 <= day_offset < len(_DAY_CURVE_TOPICS):
+        raise ValueError(f"day_offset must be 0..{len(_DAY_CURVE_TOPICS)-1}")
+    return getStecaGridResult(port, build_request(inv_id, _DAY_CURVE_TOPICS[day_offset], 0x64))
+
+
+def read_day_values(port, month_offset: int = 0, inv_id: int = 0x01):
+    """Daily yield totals. month_offset=0 → this month, 1 → last month, …, 12."""
+    if not 0 <= month_offset < len(_DAY_VALUE_TOPICS):
+        raise ValueError(f"month_offset must be 0..{len(_DAY_VALUE_TOPICS)-1}")
+    return getStecaGridResult(port, build_request(inv_id, _DAY_VALUE_TOPICS[month_offset], 0x64))
+
+
+def read_month_values(port, year_offset: int = 0, inv_id: int = 0x01):
+    """Monthly yield totals. year_offset=0 → this year, 1 → last year, …, 19."""
+    if not 0 <= year_offset < len(_MONTH_VALUE_TOPICS):
+        raise ValueError(f"year_offset must be 0..{len(_MONTH_VALUE_TOPICS)-1}")
+    return getStecaGridResult(port, build_request(inv_id, _MONTH_VALUE_TOPICS[year_offset], 0x64))
+
+
+def read_year_values(port, inv_id: int = 0x01):
+    """All yearly yield totals as array of floats."""
+    return getStecaGridResult(port, build_request(inv_id, _YEAR_VALUE_TOPIC, 0x64))
 
 # ── Bus discovery ─────────────────────────────────────────────────────────────
 def discover_inverters(port, full_scan=False):
@@ -391,33 +468,47 @@ def discover_inverters(port, full_scan=False):
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description='Read data via RS485 from StecaGrid3600')
-    parser.add_argument('-v', '--verbose',      action='store_true', help='Enable verbose output')
-    parser.add_argument('-u', '--unit',          action='store_true', help='Output unit of measurement')
-    parser.add_argument('-s', '--serial',        help=f'Serial interface (default {SERIAL_DEVICE})')
-    parser.add_argument('--id',                  default='0x01',
-                        help='RS485 inverter ID to query, hex or decimal (default 0x01)')
-    parser.add_argument('-np', '--nominal_power', action='store_true', help='Request nominal power')
-    parser.add_argument('-pp', '--panel_power',   action='store_true', help='Request panel power')
-    parser.add_argument('-pv', '--panel_voltage', action='store_true', help='Request panel voltage')
-    parser.add_argument('-pc', '--panel_current', action='store_true', help='Request panel current')
-    parser.add_argument('-ap', '--ac_power',      action='store_true', help='Request AC power')
-    parser.add_argument('-gm', '--grid_meas',     action='store_true', help='Request grid measurements (ENS1+ENS2)')
-    parser.add_argument('-el', '--event_log',     action='store_true', help='Request event log (both pages)')
-    parser.add_argument('-dy', '--daily_yield',   action='store_true', help='Request daily yield')
-    parser.add_argument('-ty', '--total_yield',   action='store_true', help='Request total yield')
-    parser.add_argument('-ti', '--time',          action='store_true', help='Request inverter time')
-    parser.add_argument('-sn', '--serial_number', action='store_true', help='Request serial number')
-    parser.add_argument('-ve', '--versions',      action='store_true', help='Request firmware versions')
-    parser.add_argument('-m1', '--mystery_one',   action='store_true', help='Request topic 0x08 (unknown)')
-    parser.add_argument('--discover',             action='store_true',
-                        help='Scan RS485 bus for inverters (quick: IDs 0x01..0x0a)')
-    parser.add_argument('--full-scan',            action='store_true',
-                        help='Used with --discover: full scan IDs 0x01..0x65')
-    parser.add_argument('--power-limit', type=int, choices=[0, 1, 2, 3],
-                        metavar='{0,1,2,3}',
-                        help='Send power limit frame: 0=100%%, 1=60%%, 2=30%%, 3=0%% '
-                             '(cmd=0x34, experimental)')
+    parser = argparse.ArgumentParser(description='Read/write data via RS485 from StecaGrid 3600')
+    parser.add_argument('-v', '--verbose',        action='store_true')
+    parser.add_argument('-u', '--unit',            action='store_true', help='Show unit of measurement')
+    parser.add_argument('-s', '--serial',          help=f'Serial port (default {SERIAL_DEVICE})')
+    parser.add_argument('--id',                    default='0x01',
+                        help='Inverter RS485 ID (default 0x01)')
+    # Read args
+    parser.add_argument('-np', '--nominal_power',  action='store_true')
+    parser.add_argument('-pp', '--panel_power',    action='store_true')
+    parser.add_argument('-pv', '--panel_voltage',  action='store_true')
+    parser.add_argument('-pc', '--panel_current',  action='store_true')
+    parser.add_argument('-ap', '--ac_power',       action='store_true')
+    parser.add_argument('-gm', '--grid_meas',      action='store_true',
+                        help='Grid measurements ENS1+ENS2')
+    parser.add_argument('-el', '--event_log',      action='store_true',
+                        help='Event log (both pages)')
+    parser.add_argument('-dy', '--daily_yield',    action='store_true')
+    parser.add_argument('-ty', '--total_yield',    action='store_true')
+    parser.add_argument('-ti', '--time',           action='store_true')
+    parser.add_argument('-sn', '--serial_number',  action='store_true')
+    parser.add_argument('-ve', '--versions',       action='store_true')
+    parser.add_argument('--bootup-timestamp',      action='store_true',
+                        help='Show inverter boot time (topic 0x08)')
+    # Historical yield
+    parser.add_argument('--day-curve',   type=int, nargs='?', const=0, metavar='N',
+                        help='Day power curve: N days ago (0=today, max 30)')
+    parser.add_argument('--day-values',  type=int, nargs='?', const=0, metavar='N',
+                        help='Daily yield totals: N months ago (0=this month, max 12)')
+    parser.add_argument('--month-values', type=int, nargs='?', const=0, metavar='N',
+                        help='Monthly yield totals: N years ago (0=this year, max 19)')
+    parser.add_argument('--year-values', action='store_true',
+                        help='All yearly yield totals')
+    # Discovery
+    parser.add_argument('--discover',    action='store_true',
+                        help='Scan RS485 bus (quick: IDs 0x01..0x0a)')
+    parser.add_argument('--full-scan',   action='store_true',
+                        help='With --discover: full scan 0x01..0x65')
+    # Write / control
+    parser.add_argument('--set-power-limit', type=int, metavar='WATTS',
+                        help='Set inverter power limit via SEM EnergyManager config '
+                             '(reads current config, sets DeratingMode=PowerLimit, writes back)')
 
     args  = parser.parse_args()
     DEBUG = args.verbose
@@ -434,74 +525,118 @@ if __name__ == "__main__":
     if DEBUG:
         print(port.get_settings())
 
+    # ── Dispatch ─────────────────────────────────────────────────────────────
+
     if args.discover:
         discover_inverters(port, args.full_scan)
         port.close()
         raise SystemExit(0)
 
-    if args.power_limit is not None:
-        req = build_power_limit_frame(args.power_limit)
+    if args.set_power_limit is not None:
+        watts = args.set_power_limit
+        print(f"Reading EnergyManager config from SEM (0x{SEM_ADDR:02x})...")
+        raw = getStecaGridResult(port, build_request(SEM_ADDR, *TOPICS["em_config"]),
+                                 timeout_s=3.0)
+        if not isinstance(raw, (bytes, bytearray)) or len(raw) < 87:
+            print(f"ERROR: Failed to read EM config (got: {raw!r})")
+            port.close()
+            raise SystemExit(1)
+        config    = bytearray(raw)
+        old_mode  = config[3]
+        old_limit = struct.unpack_from('>I', config, 40)[0]
+        config[3] = 2   # DeratingMode = PowerLimit
+        struct.pack_into('>I', config, 40, watts)
         if DEBUG:
-            print(f"# power_limit step={args.power_limit} frame: {req.hex()}")
+            print(f"# EM config: mode {old_mode}→2, limit {old_limit}→{watts} W")
+        print(f"Writing power limit {watts} W to SEM...")
+        write_req = build_write(SEM_ADDR, 0x0a, 0x60, bytes(config))
         port.reset_input_buffer()
-        port.write(req)
-        resp = read_complete_frame(port, timeout_s=2.0)
+        port.write(write_req)
+        resp = read_complete_frame(port, timeout_s=3.0)
         if resp:
-            print(f"PowerLimit response: {format_hex_bytes(resp)}")
+            print(f"SEM response: {format_hex_bytes(resp)}")
         else:
-            print("PowerLimit: no response")
+            print("WARNING: No response from SEM (may still have worked)")
         port.close()
         raise SystemExit(0)
 
     if args.event_log:
         for name in ("event_log_p1", "event_log_p2"):
-            page = name.split("_", 2)[2]   # "p1" or "p2"
-            req   = build_request(inv_id, *TOPICS[name])
-            value = getStecaGridResult(port, req, timeout_s=3.0)
+            page  = name.split("_", 2)[2]
+            value = getStecaGridResult(port, build_request(inv_id, *TOPICS[name]),
+                                       timeout_s=3.0)
             if value is None:
                 print(f"EventLog-{page}: no response")
-                continue
-            if isinstance(value, tuple):
+            elif isinstance(value, tuple):
                 total_ev, events = value
                 print(f"EventLog-{page} ({total_ev} total, {len(events)} in this frame):")
                 for ts_ev, msg in events:
                     ts_str = ts_ev.strftime("%Y-%m-%d %H:%M:%S") if ts_ev else "????-??-?? ??:??:??"
                     print(f"  {ts_str}  {msg}")
             else:
-                print(f"EventLog-{page}: unexpected response: {value}")
+                print(f"EventLog-{page}: unexpected: {value}")
         port.close()
         raise SystemExit(0)
 
-    # Build the request frame for the selected inverter ID
-    if args.nominal_power:   reqval = build_request(inv_id, *TOPICS["nominal_power"])
-    elif args.panel_power:   reqval = build_request(inv_id, *TOPICS["panel_power"])
-    elif args.panel_voltage: reqval = build_request(inv_id, *TOPICS["panel_voltage"])
-    elif args.panel_current: reqval = build_request(inv_id, *TOPICS["panel_current"])
-    elif args.ac_power:      reqval = build_request(inv_id, *TOPICS["ac_power"])
-    elif args.grid_meas:     reqval = build_request(inv_id, *TOPICS["grid_meas"])
-    elif args.daily_yield:   reqval = build_request(inv_id, *TOPICS["daily_yield"])
-    elif args.total_yield:   reqval = build_request(inv_id, *TOPICS["total_yield"])
-    elif args.time:          reqval = build_request(inv_id, *TOPICS["time"])
-    elif args.serial_number: reqval = build_request(inv_id, *TOPICS["serial"])
-    elif args.versions:      reqval = build_ping(inv_id)
-    elif args.mystery_one:   reqval = build_request(inv_id, *TOPICS["mystery_08"])
-    else:                    reqval = build_request(inv_id, *TOPICS["total_yield"])
+    # Historical yield
+    if args.day_curve is not None:
+        value = read_day_curve(port, args.day_curve, inv_id)
+        label = f"DayCurve[{args.day_curve}]"
+    elif args.day_values is not None:
+        value = read_day_values(port, args.day_values, inv_id)
+        label = f"DayValues[{args.day_values}]"
+    elif args.month_values is not None:
+        value = read_month_values(port, args.month_values, inv_id)
+        label = f"MonthValues[{args.month_values}]"
+    elif args.year_values:
+        value = read_year_values(port, inv_id)
+        label = "YearValues"
+    else:
+        label = None
+        value = None
+
+    if label is not None:
+        if value is not None:
+            if isinstance(value, (bytes, bytearray)):
+                print(f"{label}: {format_hex_bytes(value)}")
+            elif isinstance(value, list) and len(value) == 2:
+                print(f"{label}: {value[0]} {value[1]}" if uom else f"{label}: {value[0]}")
+            else:
+                print(f"{label}: {value}")
+        else:
+            print(f"{label}: no response")
+        port.close()
+        raise SystemExit(0)
+
+    # Single-value reads
+    if args.nominal_power:     reqval = build_request(inv_id, *TOPICS["nominal_power"])
+    elif args.panel_power:     reqval = build_request(inv_id, *TOPICS["panel_power"])
+    elif args.panel_voltage:   reqval = build_request(inv_id, *TOPICS["panel_voltage"])
+    elif args.panel_current:   reqval = build_request(inv_id, *TOPICS["panel_current"])
+    elif args.ac_power:        reqval = build_request(inv_id, *TOPICS["ac_power"])
+    elif args.grid_meas:       reqval = build_request(inv_id, *TOPICS["grid_meas"])
+    elif args.daily_yield:     reqval = build_request(inv_id, *TOPICS["daily_yield"])
+    elif args.total_yield:     reqval = build_request(inv_id, *TOPICS["total_yield"])
+    elif args.time:            reqval = build_request(inv_id, *TOPICS["time"])
+    elif args.serial_number:   reqval = build_request(inv_id, *TOPICS["serial"])
+    elif args.versions:        reqval = build_ping(inv_id)
+    elif args.bootup_timestamp: reqval = build_request(inv_id, *TOPICS["bootup_ts"])
+    else:                      reqval = build_request(inv_id, *TOPICS["total_yield"])
 
     value = getStecaGridResult(port, reqval)
 
     if value is not None:
         if args.grid_meas and isinstance(value, list) and value and isinstance(value[0], tuple):
-            for label, vals in value:
+            for lbl, vals in value:
                 vals_str = "  ".join(
-                    f"{v[0]:.2f} {v[1]}" if uom else f"{v[0]:.2f}"
-                    for v in vals
+                    f"{v[0]:.2f} {v[1]}" if uom else f"{v[0]:.2f}" for v in vals
                 )
-                print(f"{label}: {vals_str}")
+                print(f"{lbl}: {vals_str}")
+        elif args.bootup_timestamp and isinstance(value, list) and len(value) == 2:
+            boot_time, uptime_str = value
+            print(f"Boot time: {boot_time}  ({uptime_str})")
         elif isinstance(value, list) and len(value) == 2:
-            if uom:
-                print(value[0], value[1])
-            else:
-                print(value[0])
+            print(f"{value[0]} {value[1]}" if uom else str(value[0]))
         else:
             print(value)
 

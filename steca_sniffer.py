@@ -30,16 +30,27 @@ SERIAL_TIMEOUT  = 0.02   # short — thread reads continuously
 LOG_FILE        = "steca_sniffer.log"
 DEBUG_DROPS     = False
 
-SEM_IDS = {0x7b: "SEM-7b", 0xc9: "StecaUser-4.4"}
+SEM_IDS     = {0x7b: "SEM-7b", 0xc9: "StecaUser-4.4"}
 ID_INVERTER = 0x01
+SEM_ADDR    = 0x65   # RS485 address of the StecaGrid SEM energy manager
 
 TOPIC_NAMES = {
-    0x05: "Time",         0x08: "Mystery_08",   0x09: "Serial",
-    0x1d: "NominalPower", 0x22: "PanelPower",   0x23: "PanelVoltage",
-    0x24: "PanelCurrent", 0x29: "ACPower",       0x32: "Topic_32",
-    0x3c: "DailyYield",   0x51: "GridMeas",      0x52: "ENS_52",
-    0x53: "ENS_53",       0x5a: "EventLog_p1",   0x5b: "EventLog_p2",
-    0xf1: "TotalYield",
+    # Inverter topics
+    0x05: "Time",           0x08: "BootupTimestamp", 0x09: "SerialNumber",
+    0x1d: "NominalPower",   0x22: "PanelPower",      0x23: "PanelVoltage",
+    0x24: "PanelCurrent",   0x29: "ACPower",          0x32: "CountryCode",
+    0x33: "CountryCodeList",0x3c: "DailyYield",       0x51: "GridMeas_ENS1",
+    0x52: "GridMeas_L2",    0x53: "GridMeas_L3",      0x5a: "EventLog_p1",
+    0x5b: "EventLog_p2",    0xef: "YearValues",       0xf1: "TotalYield",
+    # SEM topics
+    0x0a: "EMConfig",       0x0b: "RelaisHistory",    0x0d: "EMLiveMeas",
+    # Historical yield — day curves (31), day values (13), month values (20)
+    **{t: f"DayCurve[{i}]"   for i, t in enumerate(
+        (0x7b, 0x75, 0x6f, 0x69, 0x63, 0x5d, 0x57, *range(0x93, 0x7b, -1)))},
+    **{t: f"DayValues[{i}]"  for i, t in enumerate(
+        (0xbf, 0xbd, 0xbb, 0xb9, 0xb7, 0xb5, 0xb3,
+         0xb1, 0xaf, 0xad, 0xab, 0xa9, 0xa8))},
+    **{t: f"MonthValues[{i}]" for i, t in enumerate(range(0xe0, 0xcc, -1))},
 }
 
 # ── CRC helpers ───────────────────────────────────────────────────────────────
@@ -144,11 +155,14 @@ def decode_frame(frame: bytes, verbose: bool) -> dict:
     exp_crc2, crc2_model = verify_crc2(frame)
     crc2_ok = (exp_crc2 == crc2) if exp_crc2 is not None else None
 
-    sem_from = SEM_IDS.get(from_id);  sem_to = SEM_IDS.get(to_id)
-    if   sem_from and to_id == ID_INVERTER:      direction = "REQUEST"
-    elif sem_to   and from_id == ID_INVERTER:    direction = "RESPONSE"
-    elif sem_from and to_id != ID_INVERTER:      direction = f"PING→0x{to_id:02x}"
-    else:                                         direction = f"UNKNOWN(from=0x{from_id:02x},to=0x{to_id:02x})"
+    sem_from = SEM_IDS.get(from_id)
+    sem_to   = SEM_IDS.get(to_id)
+    if   sem_from and to_id == ID_INVERTER:  direction = "REQUEST"
+    elif sem_to   and from_id == ID_INVERTER: direction = "RESPONSE"
+    elif sem_from and to_id == SEM_ADDR:     direction = "→SEM"
+    elif from_id  == SEM_ADDR and sem_to:    direction = "←SEM"
+    elif sem_from:                           direction = f"PING→0x{to_id:02x}"
+    else:                                    direction = f"UNKNOWN(from=0x{from_id:02x},to=0x{to_id:02x})"
 
     cmd        = payload[0] if payload else None
     topic_byte = payload[4] if len(payload) >= 5 else None
@@ -159,22 +173,61 @@ def decode_frame(frame: bytes, verbose: bool) -> dict:
     try:
         if cmd == 0x20:
             decoded = "ping"
-        elif cmd in (0x41,0x65) and topic_byte == 0xf1 and len(payload) >= 9:
+        elif cmd in (0x41, 0x65) and topic_byte == 0xf1 and len(payload) >= 9:
             v, u = _total_yield(payload[5:9]);   decoded = f"{v:.2f} {u}"
         elif cmd == 0x41 and topic_byte == 0x3c and len(payload) >= 9:
             v, u = _steca_float(payload[5:9]);   decoded = f"{v:.2f} {u}"
-        elif cmd in (0x41,0x65) and topic_byte in (0x29,0x22,0x23,0x24,0x1d) and len(payload) >= 9:
+        elif cmd in (0x41, 0x65) and topic_byte in (0x29, 0x22, 0x23, 0x24, 0x1d) and len(payload) >= 9:
             v, u = _steca_float(payload[5:9]);   decoded = f"{v:.2f} {u}"
         elif cmd == 0x65 and topic_byte == 0x05 and len(payload) >= 11:
             p = payload[5:]
             decoded = str(datetime.datetime(2000+p[0], p[1], p[2], p[3], p[4], p[5]))
+        elif cmd == 0x65 and topic_byte == 0x08 and len(payload) >= 9:
+            import datetime as _dt
+            ms = struct.unpack('>I', payload[5:9])[0]
+            boot = _dt.datetime.now() - _dt.timedelta(milliseconds=ms)
+            decoded = f"boot={boot.strftime('%Y-%m-%d %H:%M:%S')} ({ms} ms uptime)"
         elif cmd == 0x65 and topic_byte == 0x09:
             decoded = payload[5:].rstrip(b'\x00\x9f').decode('latin-1', errors='replace')
+        elif cmd == 0x65 and topic_byte == 0x0a and len(payload) >= 49:
+            # EnergyManager config summary
+            d = payload[5:]
+            mode = d[3] if len(d) > 3 else 0
+            mode_name = {0:"Off", 1:"RippleCtrl", 2:"PowerLimit", 3:"EasyBox"}.get(mode, "?")
+            limit_w   = struct.unpack('>I', d[40:44])[0] if len(d) >= 44 else 0
+            nominal_w = struct.unpack('>I', d[36:40])[0] if len(d) >= 40 else 0
+            decoded = f"EMConfig mode={mode_name}({mode}) limit={limit_w}W nominal={nominal_w}W"
         elif cmd == 0x69 and topic_byte in (0x5a, 0x5b):
             total_ev, events = decode_event_log(payload)
             page = "p1" if topic_byte == 0x5a else "p2"
             decoded   = f"event_log({page}): {total_ev} total, {len(events)} entries"
             event_log = (total_ev, events)
+        elif cmd == 0x50 and len(payload) >= 6:
+            # WriteDataById — show ID and raw data
+            id_b = payload[4]
+            data = payload[5:-1]
+            decoded = f"Write(0x50) ID=0x{id_b:02x} data={fmt_hex(data[:16])}{'…' if len(data)>16 else ''}"
+        elif cmd == 0x60 and len(payload) >= 6:
+            # DownloadById
+            id_b = payload[4]
+            data = payload[5:-1]
+            if id_b == 0x05 and len(data) >= 6:
+                try:
+                    dt = datetime.datetime(2000+data[0], data[1], data[2],
+                                           data[3], data[4], data[5])
+                    decoded = f"SetTime {dt}"
+                except Exception:
+                    decoded = f"Download(0x60) ID=0x05 data={fmt_hex(data)}"
+            elif id_b == 0x0a and to_id == SEM_ADDR and len(data) >= 44:
+                mode = data[3]
+                mode_name = {0:"Off",1:"RippleCtrl",2:"PowerLimit",3:"EasyBox"}.get(mode,"?")
+                limit_w   = struct.unpack('>I', bytes(data[40:44]))[0]
+                nominal_w = struct.unpack('>I', bytes(data[36:40]))[0]
+                decoded = (f"SetEMConfig mode={mode_name}({mode}) "
+                           f"limit={limit_w}W nominal={nominal_w}W")
+            else:
+                decoded = (f"Download(0x60) ID=0x{id_b:02x} "
+                           f"data={fmt_hex(bytes(data[:16]))}{'…' if len(data)>16 else ''}")
     except Exception as e:
         decoded = f"err:{e}"
 
