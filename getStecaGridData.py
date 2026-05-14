@@ -651,6 +651,9 @@ if __name__ == "__main__":
     parser.add_argument('--set-time', metavar='DATETIME',
                         help='Set inverter clock, format "YYYY-MM-DD HH:MM:SS". '
                              'The Steca has no DST — always pass standard/winter time.')
+    parser.add_argument('--DST', action='store_true',
+                        help='Use with --set-time / --sync-time: send summer/DST time '
+                             'instead of converting to standard/winter time.')
     parser.add_argument('--sync-time', action='store_true',
                         help='Sync inverter clock to system time. '
                              'If the system is in summer time (DST), subtracts 1 h '
@@ -712,7 +715,8 @@ if __name__ == "__main__":
             print('ERROR: --set-time requires format "YYYY-MM-DD HH:MM:SS"')
             port.close()
             raise SystemExit(1)
-        print(f"Setting inverter time to {dt}  (no DST — pass standard/winter time)")
+        time_type = "DST/summer time" if args.DST else "standard/winter time"
+        print(f"Setting inverter time to {dt}  ({time_type})")
         port.reset_input_buffer()
         port.write(build_set_time(dt, inv_id))
         _print_write_response(read_complete_frame(port, timeout_s=3.0))
@@ -723,11 +727,16 @@ if __name__ == "__main__":
 
     if args.sync_time:
         now = datetime.datetime.now()
-        # Steca has no DST: if system is currently in summer time, subtract 1 h
         is_dst = time.localtime().tm_isdst > 0
-        if is_dst:
+        if args.DST:
+            # --DST: send local/summer time as-is, no conversion
+            dst_note = " (DST mode — using local/summer time)"
+        elif is_dst:
+            # Default: Steca has no DST, convert to standard/winter time
             now -= datetime.timedelta(hours=1)
-        dst_note = " (DST active → converted to standard time)" if is_dst else " (no DST correction needed)"
+            dst_note = " (DST active → converted to standard/winter time)"
+        else:
+            dst_note = " (no DST correction needed)"
         print(f"Syncing inverter clock to {now.strftime('%Y-%m-%d %H:%M:%S')}{dst_note}")
         port.reset_input_buffer()
         port.write(build_set_time(now, inv_id))
