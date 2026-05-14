@@ -26,6 +26,23 @@ SERIAL_TIMEOUT  = 1
 SEM_ID   = 0x7b   # our RS485 sender address
 SEM_ADDR = 0x65   # RS485 address of the StecaGrid SEM energy manager
 
+_RS485_STATUS = {
+    0:  "Ok",
+    1:  "ServiceNotSupported",
+    2:  "RequestOutOfRange",
+    3:  "ReadAddressOutOfRange",
+    4:  "ReadSizeOutOfRange",
+    5:  "WriteAddressOutOfRange",
+    6:  "WriteSizeOutOfRange",
+    8:  "NoCorrectRequest",
+    9:  "Busy",
+    10: "ReceivedDataInvalid",
+    11: "Timeout",
+    12: "ReadDataInvalid",
+    15: "NoResponse",
+    16: "Error",
+}
+
 # ── Topic registry ────────────────────────────────────────────────────────────
 # name → (topic_byte, cmd_byte)
 TOPICS = {
@@ -341,11 +358,9 @@ def process_steca485(t):
                 val   = decode_stecaFloat_a(t[15 + t[14] : 15 + t[14] + 5])
                 results += [label, val]
 
-    elif t[7] == 0x51:  # WriteDataById ACK
-        results += ["WriteAck-51", [f"topic=0x{t[11]:02x}", ""]]
-
-    elif t[7] == 0x61:  # DownloadById ACK
-        results += ["WriteAck-61", [f"topic=0x{t[11]:02x} status=0x{t[8]:02x}", ""]]
+    elif t[7] in (0x51, 0x61):  # WriteDataById / DownloadById ACK
+        status = t[8]
+        results += ["WriteAck", (status, _RS485_STATUS.get(status, f"0x{status:02x}"))]
 
     elif t[7] == 0x65:  # ResponseB (UploadById)
         if t[11] == 0xf1:
@@ -541,6 +556,22 @@ def print_yearly_history_table(wh_list, ref_year: int):
     print(f"  Total  {total:>10,} Wh")
 
 
+def _print_write_response(resp_frame):
+    """Parse a write-ACK frame and print OK or ERROR status."""
+    if resp_frame is None:
+        print("WARNING: no response")
+        return
+    res = process_steca485(resp_frame)
+    if res and len(res) >= 6 and res[4] == "WriteAck":
+        status, name = res[5]
+        if status == 0:
+            print("OK")
+        else:
+            print(f"ERROR: {name} (0x{status:02x})")
+    else:
+        print(f"Response: {format_hex_bytes(resp_frame)}")
+
+
 # ── Bus discovery ─────────────────────────────────────────────────────────────
 def discover_inverters(port, full_scan=False):
     id_range   = range(1, 0x66) if full_scan else range(1, 11)
@@ -670,11 +701,7 @@ if __name__ == "__main__":
         write_req = build_write(SEM_ADDR, 0x0a, 0x60, bytes(config))
         port.reset_input_buffer()
         port.write(write_req)
-        resp = read_complete_frame(port, timeout_s=3.0)
-        if resp:
-            print(f"SEM response: {format_hex_bytes(resp)}")
-        else:
-            print("WARNING: No response from SEM (may still have worked)")
+        _print_write_response(read_complete_frame(port, timeout_s=3.0))
         port.close()
         raise SystemExit(0)
 
@@ -688,8 +715,7 @@ if __name__ == "__main__":
         print(f"Setting inverter time to {dt}  (no DST — pass standard/winter time)")
         port.reset_input_buffer()
         port.write(build_set_time(dt, inv_id))
-        resp = read_complete_frame(port, timeout_s=3.0)
-        print(f"Response: {format_hex_bytes(resp)}" if resp else "WARNING: no response")
+        _print_write_response(read_complete_frame(port, timeout_s=3.0))
         port.close()
         raise SystemExit(0)
 
@@ -703,8 +729,7 @@ if __name__ == "__main__":
         print(f"Syncing inverter clock to {now.strftime('%Y-%m-%d %H:%M:%S')}{dst_note}")
         port.reset_input_buffer()
         port.write(build_set_time(now, inv_id))
-        resp = read_complete_frame(port, timeout_s=3.0)
-        print(f"Response: {format_hex_bytes(resp)}" if resp else "WARNING: no response")
+        _print_write_response(read_complete_frame(port, timeout_s=3.0))
         port.close()
         raise SystemExit(0)
 
