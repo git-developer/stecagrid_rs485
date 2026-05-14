@@ -59,6 +59,10 @@ _DAY_VALUE_TOPICS   = (0xbf, 0xbd, 0xbb, 0xb9, 0xb7, 0xb5, 0xb3,
 _MONTH_VALUE_TOPICS = tuple(range(0xe0, 0xcc, -1))     # 20: this year → −19
 _YEAR_VALUE_TOPIC   = 0xef                              # all years as float array
 
+_DAY_CURVE_TOPICS_SET = frozenset(_DAY_CURVE_TOPICS)
+_ALL_HIST_TOPICS      = (_DAY_CURVE_TOPICS_SET | frozenset(_DAY_VALUE_TOPICS)
+                         | frozenset(_MONTH_VALUE_TOPICS) | {_YEAR_VALUE_TOPIC})
+
 # ── Frame builders ────────────────────────────────────────────────────────────
 def build_ping(to_id: int, sem_id: int = SEM_ID) -> bytes:
     """12-byte ping / bus-discovery frame."""
@@ -364,6 +368,15 @@ def process_steca485(t):
         elif t[11] == 0x0a:
             # EnergyManager config (from SEM)
             results += ["EMConfig", t[12:-4]]
+        elif t[11] in _ALL_HIST_TOPICS:
+            raw = t[12:-4]
+            n   = (len(raw) // 4) * 4
+            is_curve = t[11] in _DAY_CURVE_TOPICS_SET
+            wh_list = []
+            for i in range(0, n, 4):
+                f, = struct.unpack_from('<f', raw, i)
+                wh_list.append(int(round(f * 6 if is_curve else f)))
+            results += ["HistYield", (wh_list, "Wh")]
         else:
             results += ["???", [format_hex_bytes(t[12:min(12+16, len(t)-4)]), ""]]
 
@@ -407,6 +420,16 @@ def getStecaGridResult(port, req, timeout_s=2.0, retries=3):
             time.sleep(0.3)
     return None
 
+def get_inverter_time(port, inv_id: int = 0x01) -> datetime.datetime:
+    """Get inverter datetime; fall back to PC time on failure."""
+    try:
+        val = getStecaGridResult(port, build_request(inv_id, *TOPICS["time"]))
+        if isinstance(val, list) and len(val) == 2 and isinstance(val[0], datetime.datetime):
+            return val[0]
+    except Exception:
+        pass
+    return datetime.datetime.now()
+
 # ── Historical yield helpers ──────────────────────────────────────────────────
 def read_day_curve(port, day_offset: int = 0, inv_id: int = 0x01):
     """Power curve for a day. day_offset=0 → today, 1 → yesterday, …, 30."""
@@ -432,6 +455,91 @@ def read_month_values(port, year_offset: int = 0, inv_id: int = 0x01):
 def read_year_values(port, inv_id: int = 0x01):
     """All yearly yield totals as array of floats."""
     return getStecaGridResult(port, build_request(inv_id, _YEAR_VALUE_TOPIC, 0x64))
+
+# ── Yield table formatters ────────────────────────────────────────────────────
+def print_day_curve_table(wh_list, ref_date, day_offset: int):
+    queried = ref_date - datetime.timedelta(days=day_offset)
+    suffix  = "  (today)" if day_offset == 0 else ""
+    header  = f"Day curve: {queried}{suffix}"
+    print(header)
+    print("─" * max(len(header), 30))
+    first = next((i for i, v in enumerate(wh_list) if v), None)
+    if first is None:
+        print("  (no data)")
+        return
+    last = len(wh_list) - 1 - next(i for i, v in enumerate(reversed(wh_list)) if v)
+    total = 0
+    for idx in range(first, last + 1):
+        wh = wh_list[idx]
+        hh, mm = divmod(idx * 10, 60)
+        print(f"  {hh:02d}:{mm:02d}  {wh:>8,} Wh")
+        total += wh
+    print("─" * max(len(header), 30))
+    print(f"  Total:  {total:>8,} Wh")
+
+
+def print_day_values_table(wh_list, ref_date, month_offset: int):
+    y, m = ref_date.year, ref_date.month
+    for _ in range(month_offset):
+        m -= 1
+        if m == 0:
+            m, y = 12, y - 1
+    month_label = datetime.date(y, m, 1).strftime("%B %Y")
+    header = f"Daily yield: {month_label}"
+    print(header)
+    print("─" * max(len(header), 26))
+    end = len(wh_list)
+    while end > 0 and wh_list[end - 1] == 0:
+        end -= 1
+    total = 0
+    for i in range(end):
+        try:
+            dt = datetime.date(y, m, i + 1)
+        except ValueError:
+            break
+        print(f"  {dt}  {wh_list[i]:>8,} Wh")
+        total += wh_list[i]
+    print("─" * max(len(header), 26))
+    print(f"  Total:      {total:>8,} Wh")
+
+
+def print_month_values_table(wh_list, ref_date, year_offset: int):
+    year = ref_date.year - year_offset
+    header = f"Monthly yield: {year}"
+    print(header)
+    print("─" * max(len(header), 24))
+    _MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
+               "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+    end = min(len(wh_list), 12)
+    while end > 0 and wh_list[end - 1] == 0:
+        end -= 1
+    total = 0
+    for i in range(end):
+        print(f"  {_MONTHS[i]}  {wh_list[i]:>10,} Wh")
+        total += wh_list[i]
+    print("─" * max(len(header), 24))
+    print(f"  Total  {total:>10,} Wh")
+
+
+def print_year_values_table(wh_list, ref_year: int):
+    start = 0
+    while start < len(wh_list) and wh_list[start] == 0:
+        start += 1
+    data = wh_list[start:]
+    if not data:
+        print("  (no data)")
+        return
+    print("Yearly yield")
+    print("─" * 20)
+    total = 0
+    n = len(data)
+    for i, wh in enumerate(reversed(data)):
+        year = ref_year - (n - 1 - i)
+        print(f"  {year}  {wh:>10,} Wh")
+        total += wh
+    print("─" * 20)
+    print(f"  Total  {total:>10,} Wh")
+
 
 # ── Bus discovery ─────────────────────────────────────────────────────────────
 def discover_inverters(port, full_scan=False):
@@ -579,32 +687,34 @@ if __name__ == "__main__":
         raise SystemExit(0)
 
     # Historical yield
-    if args.day_curve is not None:
-        value = read_day_curve(port, args.day_curve, inv_id)
-        label = f"DayCurve[{args.day_curve}]"
-    elif args.day_values is not None:
-        value = read_day_values(port, args.day_values, inv_id)
-        label = f"DayValues[{args.day_values}]"
-    elif args.month_values is not None:
-        value = read_month_values(port, args.month_values, inv_id)
-        label = f"MonthValues[{args.month_values}]"
-    elif args.year_values:
-        value = read_year_values(port, inv_id)
-        label = "YearValues"
-    else:
-        label = None
-        value = None
-
-    if label is not None:
-        if value is not None:
-            if isinstance(value, (bytes, bytearray)):
-                print(f"{label}: {format_hex_bytes(value)}")
-            elif isinstance(value, list) and len(value) == 2:
-                print(f"{label}: {value[0]} {value[1]}" if uom else f"{label}: {value[0]}")
+    if args.day_curve is not None or args.day_values is not None \
+            or args.month_values is not None or args.year_values:
+        steca_dt = get_inverter_time(port, inv_id)
+        ref_date = steca_dt.date()
+        if args.day_curve is not None:
+            result = read_day_curve(port, args.day_curve, inv_id)
+            if result is None:
+                print("DayCurve: no response")
             else:
-                print(f"{label}: {value}")
-        else:
-            print(f"{label}: no response")
+                print_day_curve_table(result[0], ref_date, args.day_curve)
+        elif args.day_values is not None:
+            result = read_day_values(port, args.day_values, inv_id)
+            if result is None:
+                print("DayValues: no response")
+            else:
+                print_day_values_table(result[0], ref_date, args.day_values)
+        elif args.month_values is not None:
+            result = read_month_values(port, args.month_values, inv_id)
+            if result is None:
+                print("MonthValues: no response")
+            else:
+                print_month_values_table(result[0], ref_date, args.month_values)
+        elif args.year_values:
+            result = read_year_values(port, inv_id)
+            if result is None:
+                print("YearValues: no response")
+            else:
+                print_year_values_table(result[0], steca_dt.year)
         port.close()
         raise SystemExit(0)
 
