@@ -716,6 +716,8 @@ if __name__ == "__main__":
         port.reset_input_buffer()
         port.write(build_set_time(dt, inv_id))
         _print_write_response(read_complete_frame(port, timeout_s=3.0))
+        confirmed = get_inverter_time(port, inv_id)
+        print(f"Inverter time: {confirmed.strftime('%Y-%m-%d %H:%M:%S')}")
         port.close()
         raise SystemExit(0)
 
@@ -730,6 +732,8 @@ if __name__ == "__main__":
         port.reset_input_buffer()
         port.write(build_set_time(now, inv_id))
         _print_write_response(read_complete_frame(port, timeout_s=3.0))
+        confirmed = get_inverter_time(port, inv_id)
+        print(f"Inverter time: {confirmed.strftime('%Y-%m-%d %H:%M:%S')}")
         port.close()
         raise SystemExit(0)
 
