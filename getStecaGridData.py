@@ -457,10 +457,10 @@ def read_year_values(port, inv_id: int = 0x01):
     return getStecaGridResult(port, build_request(inv_id, _YEAR_VALUE_TOPIC, 0x64))
 
 # ── Yield table formatters ────────────────────────────────────────────────────
-def print_day_curve_table(wh_list, ref_date, day_offset: int):
+def print_10min_history_table(wh_list, ref_date, day_offset: int):
     queried = ref_date - datetime.timedelta(days=day_offset)
     suffix  = "  (today)" if day_offset == 0 else ""
-    header  = f"Day curve: {queried}{suffix}"
+    header  = f"10-min history: {queried}{suffix}"
     print(header)
     print("─" * max(len(header), 30))
     first = next((i for i, v in enumerate(wh_list) if v), None)
@@ -478,14 +478,14 @@ def print_day_curve_table(wh_list, ref_date, day_offset: int):
     print(f"  Total:  {total:>8,} Wh")
 
 
-def print_day_values_table(wh_list, ref_date, month_offset: int):
+def print_daily_history_table(wh_list, ref_date, month_offset: int):
     y, m = ref_date.year, ref_date.month
     for _ in range(month_offset):
         m -= 1
         if m == 0:
             m, y = 12, y - 1
     month_label = datetime.date(y, m, 1).strftime("%B %Y")
-    header = f"Daily yield: {month_label}"
+    header = f"Daily history: {month_label}"
     print(header)
     print("─" * max(len(header), 26))
     end = len(wh_list)
@@ -503,9 +503,9 @@ def print_day_values_table(wh_list, ref_date, month_offset: int):
     print(f"  Total:      {total:>8,} Wh")
 
 
-def print_month_values_table(wh_list, ref_date, year_offset: int):
+def print_monthly_history_table(wh_list, ref_date, year_offset: int):
     year = ref_date.year - year_offset
-    header = f"Monthly yield: {year}"
+    header = f"Monthly history: {year}"
     print(header)
     print("─" * max(len(header), 24))
     _MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
@@ -521,7 +521,7 @@ def print_month_values_table(wh_list, ref_date, year_offset: int):
     print(f"  Total  {total:>10,} Wh")
 
 
-def print_year_values_table(wh_list, ref_year: int):
+def print_yearly_history_table(wh_list, ref_year: int):
     start = 0
     while start < len(wh_list) and wh_list[start] == 0:
         start += 1
@@ -529,15 +529,15 @@ def print_year_values_table(wh_list, ref_year: int):
     if not data:
         print("  (no data)")
         return
-    print("Yearly yield")
-    print("─" * 20)
+    print("Yearly history")
+    print("─" * 22)
     total = 0
     n = len(data)
     for i, wh in enumerate(reversed(data)):
         year = ref_year - (n - 1 - i)
         print(f"  {year}  {wh:>10,} Wh")
         total += wh
-    print("─" * 20)
+    print("─" * 22)
     print(f"  Total  {total:>10,} Wh")
 
 
@@ -600,20 +600,30 @@ if __name__ == "__main__":
     parser.add_argument('--bootup-timestamp',      action='store_true',
                         help='Show inverter boot time (topic 0x08)')
     # Historical yield
-    parser.add_argument('--day-curve',   type=int, nargs='?', const=0, metavar='N',
-                        help='Day power curve: N days ago (0=today, max 30)')
-    parser.add_argument('--day-values',  type=int, nargs='?', const=0, metavar='N',
-                        help='Daily yield totals: N months ago (0=this month, max 12)')
-    parser.add_argument('--month-values', type=int, nargs='?', const=0, metavar='N',
-                        help='Monthly yield totals: N years ago (0=this year, max 19)')
-    parser.add_argument('--year-values', action='store_true',
-                        help='All yearly yield totals')
+    parser.add_argument('--10min-history',   type=int, nargs='?', const=0, metavar='N',
+                        dest='hist_10min',
+                        help='10-min power history: N days ago (0=today, max 30)')
+    parser.add_argument('--daily-history',   type=int, nargs='?', const=0, metavar='N',
+                        dest='hist_daily',
+                        help='Daily yield history: N months ago (0=this month, max 12)')
+    parser.add_argument('--monthly-history', type=int, nargs='?', const=0, metavar='N',
+                        dest='hist_monthly',
+                        help='Monthly yield history: N years ago (0=this year, max 19)')
+    parser.add_argument('--yearly-history',  action='store_true', dest='hist_yearly',
+                        help='All yearly yield history')
     # Discovery
     parser.add_argument('--discover',    action='store_true',
                         help='Scan RS485 bus (quick: IDs 0x01..0x0a)')
     parser.add_argument('--full-scan',   action='store_true',
                         help='With --discover: full scan 0x01..0x65')
     # Write / control
+    parser.add_argument('--set-time', metavar='DATETIME',
+                        help='Set inverter clock, format "YYYY-MM-DD HH:MM:SS". '
+                             'The Steca has no DST — always pass standard/winter time.')
+    parser.add_argument('--sync-time', action='store_true',
+                        help='Sync inverter clock to system time. '
+                             'If the system is in summer time (DST), subtracts 1 h '
+                             'before writing — the Steca has no DST support.')
     parser.add_argument('--set-power-limit', type=int, metavar='WATTS',
                         help='Set inverter power limit via SEM EnergyManager config '
                              '(reads current config, sets DeratingMode=PowerLimit, writes back)')
@@ -668,6 +678,36 @@ if __name__ == "__main__":
         port.close()
         raise SystemExit(0)
 
+    if args.set_time:
+        try:
+            dt = datetime.datetime.strptime(args.set_time, "%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            print('ERROR: --set-time requires format "YYYY-MM-DD HH:MM:SS"')
+            port.close()
+            raise SystemExit(1)
+        print(f"Setting inverter time to {dt}  (no DST — pass standard/winter time)")
+        port.reset_input_buffer()
+        port.write(build_set_time(dt, inv_id))
+        resp = read_complete_frame(port, timeout_s=3.0)
+        print(f"Response: {format_hex_bytes(resp)}" if resp else "WARNING: no response")
+        port.close()
+        raise SystemExit(0)
+
+    if args.sync_time:
+        now = datetime.datetime.now()
+        # Steca has no DST: if system is currently in summer time, subtract 1 h
+        is_dst = time.localtime().tm_isdst > 0
+        if is_dst:
+            now -= datetime.timedelta(hours=1)
+        dst_note = " (DST active → converted to standard time)" if is_dst else " (no DST correction needed)"
+        print(f"Syncing inverter clock to {now.strftime('%Y-%m-%d %H:%M:%S')}{dst_note}")
+        port.reset_input_buffer()
+        port.write(build_set_time(now, inv_id))
+        resp = read_complete_frame(port, timeout_s=3.0)
+        print(f"Response: {format_hex_bytes(resp)}" if resp else "WARNING: no response")
+        port.close()
+        raise SystemExit(0)
+
     if args.event_log:
         for name in ("event_log_p1", "event_log_p2"):
             page  = name.split("_", 2)[2]
@@ -687,34 +727,34 @@ if __name__ == "__main__":
         raise SystemExit(0)
 
     # Historical yield
-    if args.day_curve is not None or args.day_values is not None \
-            or args.month_values is not None or args.year_values:
+    if args.hist_10min is not None or args.hist_daily is not None \
+            or args.hist_monthly is not None or args.hist_yearly:
         steca_dt = get_inverter_time(port, inv_id)
         ref_date = steca_dt.date()
-        if args.day_curve is not None:
-            result = read_day_curve(port, args.day_curve, inv_id)
+        if args.hist_10min is not None:
+            result = read_day_curve(port, args.hist_10min, inv_id)
             if result is None:
-                print("DayCurve: no response")
+                print("10-min history: no response")
             else:
-                print_day_curve_table(result[0], ref_date, args.day_curve)
-        elif args.day_values is not None:
-            result = read_day_values(port, args.day_values, inv_id)
+                print_10min_history_table(result[0], ref_date, args.hist_10min)
+        elif args.hist_daily is not None:
+            result = read_day_values(port, args.hist_daily, inv_id)
             if result is None:
-                print("DayValues: no response")
+                print("Daily history: no response")
             else:
-                print_day_values_table(result[0], ref_date, args.day_values)
-        elif args.month_values is not None:
-            result = read_month_values(port, args.month_values, inv_id)
+                print_daily_history_table(result[0], ref_date, args.hist_daily)
+        elif args.hist_monthly is not None:
+            result = read_month_values(port, args.hist_monthly, inv_id)
             if result is None:
-                print("MonthValues: no response")
+                print("Monthly history: no response")
             else:
-                print_month_values_table(result[0], ref_date, args.month_values)
-        elif args.year_values:
+                print_monthly_history_table(result[0], ref_date, args.hist_monthly)
+        elif args.hist_yearly:
             result = read_year_values(port, inv_id)
             if result is None:
-                print("YearValues: no response")
+                print("Yearly history: no response")
             else:
-                print_year_values_table(result[0], steca_dt.year)
+                print_yearly_history_table(result[0], steca_dt.year)
         port.close()
         raise SystemExit(0)
 
