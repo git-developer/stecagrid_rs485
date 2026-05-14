@@ -266,9 +266,10 @@ usage: getStecaGridData.py [-h] [-v] [-u] [-s SERIAL] [--id ID]
                            [-np] [-pp] [-pv] [-pc] [-ap] [-gm] [-el]
                            [-dy] [-ty] [-ti] [-sn] [-ve]
                            [--bootup-timestamp]
-                           [--day-curve [N]] [--day-values [N]]
-                           [--month-values [N]] [--year-values]
+                           [--10min-history [N]] [--daily-history [N]]
+                           [--monthly-history [N]] [--yearly-history]
                            [--discover] [--full-scan]
+                           [--set-time DATETIME] [--sync-time] [--DST]
                            [--set-power-limit WATTS]
 
 Read options:
@@ -287,20 +288,42 @@ Read options:
   --bootup-timestamp   Inverter boot time (topic 0x08)
 
 Historical yield (UploadById, index 0 = most recent):
-  --day-curve [N]    Day power curve (0=today, max 30)
-  --day-values [N]   Daily yield totals for month (0=this month, max 12)
-  --month-values [N] Monthly yield totals for year (0=this year, max 19)
-  --year-values      All yearly yield totals
+  --10min-history [N]    10-minute power curve (0=today, max 30)
+  --daily-history [N]    Daily yield totals for month (0=this month, max 12)
+  --monthly-history [N]  Monthly yield totals for year (0=this year, max 19)
+  --yearly-history       All yearly yield totals
 
 Discovery:
   --discover    Scan RS485 bus (IDs 0x01..0x0a)
   --full-scan   With --discover: scan 0x01..0x65
+
+Clock:
+  --set-time DATETIME   Set inverter clock ("YYYY-MM-DD HH:MM:SS").
+                        The Steca has no DST — pass standard/winter time by default.
+  --sync-time           Sync inverter clock to system time.
+                        Subtracts 1 h during DST season (standard time) unless --DST.
+  --DST                 Use with --set-time / --sync-time: send summer/DST time
+                        instead of converting to standard/winter time.
 
 Write / control:
   --set-power-limit WATTS
       Read EnergyManager config from SEM (0x65), set DeratingMode=PowerLimit
       and DeratingPowerLimitW=WATTS, write back. Requires SEM connected.
 ```
+
+### Write ACK response codes
+All write operations (`0x50`/`0x60`) return a status byte decoded as:
+
+| Code | Name |
+|------|------|
+| `0x00` | Ok |
+| `0x01` | ServiceNotSupported |
+| `0x02` | RequestOutOfRange |
+| `0x08` | NoCorrectRequest |
+| `0x09` | Busy |
+| `0x0a` | ReceivedDataInvalid |
+| `0x0f` | NoResponse |
+| `0x10` | Error |
 
 ### Examples
 ```bash
@@ -310,10 +333,68 @@ $ python3 getStecaGridData.py -ty -u
 $ python3 getStecaGridData.py --bootup-timestamp
 Boot time: 2026-05-13 05:30:12  (24048000 ms uptime)
 
+$ python3 getStecaGridData.py --sync-time
+Syncing inverter clock to 2026-05-14 21:30:00 (no DST correction needed)
+OK
+Inverter time: 2026-05-14 21:30:01
+
+$ python3 getStecaGridData.py --sync-time
+Syncing inverter clock to 2026-05-14 21:30:00 (DST active → converted to standard/winter time)
+OK
+Inverter time: 2026-05-14 21:30:01
+
+$ python3 getStecaGridData.py --sync-time --DST
+Syncing inverter clock to 2026-05-14 22:30:00 (DST mode — using local/summer time)
+OK
+Inverter time: 2026-05-14 22:30:01
+
+$ python3 getStecaGridData.py --set-time "2026-05-14 21:30:00"
+Setting inverter time to 2026-05-14 21:30:00  (standard/winter time)
+OK
+Inverter time: 2026-05-14 21:30:01
+
+$ python3 getStecaGridData.py --10min-history
+10-min history: 2026-05-14  (today)
+──────────────────────────────────
+  06:20         6 Wh
+  06:30        12 Wh
+  ...
+  21:40        18 Wh
+──────────────────────────────────
+  Total:    8,169 Wh
+
+$ python3 getStecaGridData.py --daily-history
+Daily history: May 2026
+──────────────────────────
+  2026-05-01    14,700 Wh
+  2026-05-02    26,040 Wh
+  ...
+──────────────────────────
+  Total:       193,270 Wh
+
+$ python3 getStecaGridData.py --monthly-history
+Monthly history: 2026
+─────────────────────────
+  Jan      78,610 Wh
+  Feb     109,380 Wh
+  ...
+─────────────────────────
+  Total    563,860 Wh
+
+$ python3 getStecaGridData.py --yearly-history
+Yearly history
+──────────────────────
+  2014    9,500,000 Wh
+  2015   12,300,000 Wh
+  ...
+  2026       32,300 Wh
+──────────────────────
+  Total  154,132,300 Wh
+
 $ python3 getStecaGridData.py --set-power-limit 2000
 Reading EnergyManager config from SEM (0x65)...
 Writing power limit 2000 W to SEM...
-SEM response: 02 01 ...
+OK
 
 $ python3 getStecaGridData.py --discover --full-scan
 StecaGrid RS485 Bus Discovery
@@ -392,9 +473,11 @@ HMI / PU / ENS2 — Net11
 
 ## Open Topics
 - **EnergyManager payload endianness**: assumed big-endian; unverified without a live SEM capture.
-- **Historical yield data format**: topic IDs are known; exact float encoding per series unverified.
+- **Historical yield float encoding**: verified against live inverter (StecaGrid 3600):
+  DayCurve slots `× 6 → Wh`; DayValues / MonthValues / YearValues `round(f) → Wh`.
+  Leading all-zero 4-byte groups are padding and are skipped before decoding.
 - **SEM live measurements** (topic `0x0d`): structure unknown.
-- **Write / control frames**: `--set-power-limit` requires a connected SEM and is untested on hardware.
+- **`--set-power-limit`**: requires a connected SEM; untested on hardware.
 
 ---
 
