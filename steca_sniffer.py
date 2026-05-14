@@ -34,23 +34,39 @@ SEM_IDS     = {0x7b: "SEM-7b", 0xc9: "StecaUser-4.4"}
 ID_INVERTER = 0x01
 SEM_ADDR    = 0x65   # RS485 address of the StecaGrid SEM energy manager
 
+_RS485_STATUS = {
+    0:  "Ok",                  1:  "ServiceNotSupported",
+    2:  "RequestOutOfRange",   3:  "ReadAddressOutOfRange",
+    4:  "ReadSizeOutOfRange",  5:  "WriteAddressOutOfRange",
+    6:  "WriteSizeOutOfRange", 8:  "NoCorrectRequest",
+    9:  "Busy",                10: "ReceivedDataInvalid",
+    11: "Timeout",             12: "ReadDataInvalid",
+    15: "NoResponse",          16: "Error",
+}
+
+_10MIN_HIST_TOPICS = frozenset(
+    (0x7b, 0x75, 0x6f, 0x69, 0x63, 0x5d, 0x57, *range(0x93, 0x7b, -1)))
+_ALL_HIST_TOPICS   = _10MIN_HIST_TOPICS | frozenset(
+    (0xbf, 0xbd, 0xbb, 0xb9, 0xb7, 0xb5, 0xb3,
+     0xb1, 0xaf, 0xad, 0xab, 0xa9, 0xa8)) | frozenset(range(0xe0, 0xcc, -1)) | {0xef}
+
 TOPIC_NAMES = {
     # Inverter topics
-    0x05: "Time",           0x08: "BootupTimestamp", 0x09: "SerialNumber",
-    0x1d: "NominalPower",   0x22: "PanelPower",      0x23: "PanelVoltage",
-    0x24: "PanelCurrent",   0x29: "ACPower",          0x32: "CountryCode",
-    0x33: "CountryCodeList",0x3c: "DailyYield",       0x51: "GridMeas_ENS1",
-    0x52: "GridMeas_L2",    0x53: "GridMeas_L3",      0x5a: "EventLog_p1",
-    0x5b: "EventLog_p2",    0xef: "YearValues",       0xf1: "TotalYield",
+    0x05: "Time",             0x08: "BootupTimestamp",  0x09: "SerialNumber",
+    0x1d: "NominalPower",     0x22: "PanelPower",       0x23: "PanelVoltage",
+    0x24: "PanelCurrent",     0x29: "ACPower",           0x32: "CountryCode",
+    0x33: "CountryCodeList",  0x3c: "DailyYield",        0x51: "GridMeas_ENS1",
+    0x52: "GridMeas_L2",      0x53: "GridMeas_L3",       0x5a: "EventLog_p1",
+    0x5b: "EventLog_p2",      0xef: "YearlyHistory",     0xf1: "TotalYield",
     # SEM topics
-    0x0a: "EMConfig",       0x0b: "RelaisHistory",    0x0d: "EMLiveMeas",
-    # Historical yield — day curves (31), day values (13), month values (20)
-    **{t: f"DayCurve[{i}]"   for i, t in enumerate(
+    0x0a: "EMConfig",         0x0b: "RelaisHistory",     0x0d: "EMLiveMeas",
+    # Historical yield — 10-min curves (31), daily (13), monthly (20)
+    **{t: f"10minHistory[{i}]"   for i, t in enumerate(
         (0x7b, 0x75, 0x6f, 0x69, 0x63, 0x5d, 0x57, *range(0x93, 0x7b, -1)))},
-    **{t: f"DayValues[{i}]"  for i, t in enumerate(
+    **{t: f"DailyHistory[{i}]"   for i, t in enumerate(
         (0xbf, 0xbd, 0xbb, 0xb9, 0xb7, 0xb5, 0xb3,
          0xb1, 0xaf, 0xad, 0xab, 0xa9, 0xa8))},
-    **{t: f"MonthValues[{i}]" for i, t in enumerate(range(0xe0, 0xcc, -1))},
+    **{t: f"MonthlyHistory[{i}]" for i, t in enumerate(range(0xe0, 0xcc, -1))},
 }
 
 # ── CRC helpers ───────────────────────────────────────────────────────────────
@@ -197,6 +213,26 @@ def decode_frame(frame: bytes, verbose: bool) -> dict:
             limit_w   = struct.unpack('>I', d[40:44])[0] if len(d) >= 44 else 0
             nominal_w = struct.unpack('>I', d[36:40])[0] if len(d) >= 40 else 0
             decoded = f"EMConfig mode={mode_name}({mode}) limit={limit_w}W nominal={nominal_w}W"
+        elif cmd in (0x51, 0x61) and len(payload) >= 5:
+            # WriteDataById ACK (0x51) / DownloadById ACK (0x61)
+            status    = payload[1]
+            name      = _RS485_STATUS.get(status, f"0x{status:02x}")
+            ack_label = "DownloadACK" if cmd == 0x61 else "WriteACK"
+            ok_mark   = "✓" if status == 0 else "✗"
+            decoded   = f"{ack_label} topic=0x{topic_byte:02x} [{ok_mark}] {name}(0x{status:02x})"
+        elif cmd == 0x65 and topic_byte in _ALL_HIST_TOPICS:
+            raw = payload[5:-1]
+            n   = (len(raw) // 4) * 4
+            is_curve = topic_byte in _10MIN_HIST_TOPICS
+            vals = []
+            for i in range(0, n, 4):
+                f, = struct.unpack_from('<f', raw, i)
+                vals.append(int(round(f * 6 if is_curve else f)))
+            nonzero = [v for v in vals if v]
+            total   = sum(nonzero)
+            peak    = max(nonzero) if nonzero else 0
+            decoded = (f"{len(nonzero)} non-zero slots  total={total:,} Wh  peak={peak:,} Wh"
+                       f"  ({len(vals)} slots total)")
         elif cmd == 0x69 and topic_byte in (0x5a, 0x5b):
             total_ev, events = decode_event_log(payload)
             page = "p1" if topic_byte == 0x5a else "p2"
