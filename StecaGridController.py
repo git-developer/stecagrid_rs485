@@ -659,9 +659,6 @@ if __name__ == "__main__":
                         help='Sync inverter clock to system time. '
                              'If the system is in summer time (DST), subtracts 1 h '
                              'before writing — the Steca has no DST support.')
-    parser.add_argument('--set-power-limit', type=int, metavar='WATTS',
-                        help='Set inverter power limit via SEM EnergyManager config '
-                             '(reads current config, sets DeratingMode=PowerLimit, writes back)')
     # Active-power setpoint (EMLiveMeas)
     _em_lvl_help = ", ".join(f"{k}={v}%" for k, v in EM_LEVELS.items())
     parser.add_argument('--setpoint', type=int, metavar='PERMILLE',
@@ -691,30 +688,6 @@ if __name__ == "__main__":
 
     if args.discover:
         discover_inverters(port, args.full_scan)
-        port.close()
-        raise SystemExit(0)
-
-    if args.set_power_limit is not None:
-        watts = args.set_power_limit
-        print(f"Reading EnergyManager config from SEM (0x{SEM_ADDR:02x})...")
-        raw = getStecaGridResult(port, build_request(SEM_ADDR, *TOPICS["em_config"]),
-                                 timeout_s=3.0)
-        if not isinstance(raw, (bytes, bytearray)) or len(raw) < 87:
-            print(f"ERROR: Failed to read EM config (got: {raw!r})")
-            port.close()
-            raise SystemExit(1)
-        config    = bytearray(raw)
-        old_mode  = config[3]
-        old_limit = struct.unpack_from('>I', config, 40)[0]
-        config[3] = 2   # DeratingMode = PowerLimit
-        struct.pack_into('>I', config, 40, watts)
-        if DEBUG:
-            print(f"# EM config: mode {old_mode}→2, limit {old_limit}→{watts} W")
-        print(f"Writing power limit {watts} W to SEM...")
-        write_req = build_write(SEM_ADDR, 0x0a, 0x60, bytes(config))
-        port.reset_input_buffer()
-        port.write(write_req)
-        _print_write_response(read_complete_frame(port, timeout_s=3.0))
         port.close()
         raise SystemExit(0)
 

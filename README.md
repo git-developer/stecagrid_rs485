@@ -307,7 +307,6 @@ usage: StecaGridController.py [-h] [-v] [-u] [-s SERIAL] [--id ID]
                            [--monthly-history [N]] [--yearly-history]
                            [--discover] [--full-scan]
                            [--set-time DATETIME] [--sync-time] [--DST]
-                           [--set-power-limit WATTS]
 
 Read options:
   -ap   AC power (W)
@@ -343,9 +342,6 @@ Clock:
                         instead of converting to standard/winter time.
 
 Write / control:
-  --set-power-limit WATTS
-      Read EnergyManager config from SEM (0x65), set DeratingMode=PowerLimit
-      and DeratingPowerLimitW=WATTS, write back. Requires SEM connected.
   --setpoint PERMILLE
       Send active-power setpoint in permille (0..1000) directly to inverter.
       WARNING: do not use with physical SEM on bus; repeat periodically.
@@ -433,11 +429,6 @@ Yearly history
 ──────────────────────
   Total  154,132,300 Wh
 
-$ python3 StecaGridController.py --set-power-limit 2000
-Reading EnergyManager config from SEM (0x65)...
-Writing power limit 2000 W to SEM...
-OK
-
 $ python3 StecaGridController.py --discover --full-scan
 StecaGrid RS485 Bus Discovery
   Scanning: 101 IDs (0x01..0x65)
@@ -519,7 +510,6 @@ HMI / PU / ENS2 — Net11
   DayCurve slots `× 6 → Wh`; DayValues / MonthValues / YearValues `round(f) → Wh`.
   Leading all-zero 4-byte groups are padding and are skipped before decoding.
 - **SEM live measurements** (topic `0x0d`): structure unknown.
-- **`--set-power-limit`**: requires a connected SEM; untested on hardware.
 
 ---
 
