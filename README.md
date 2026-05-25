@@ -150,6 +150,43 @@ Index 0 = most recent period, index N = N periods ago.
 [83-86] uint32: Deactivation.HoldTime_s
 ```
 
+### Active-power setpoint (EMLiveMeas)
+
+Write(0x50) on Topic `0x0d`, TO=`0x01` (inverter), FROM=`0x7b` (SEM sender).
+Verified against live hardware across all four relay levels.
+
+**Promille encoding** — 16-bit big-endian, 0..1000 (= 0.0 %..100.0 %, 0.1 % resolution):
+
+| Relay level | Percent | Promille | `<hi> <lo>` |
+|-------------|---------|----------|-------------|
+| K1          | 0 %     | 0        | `00 00`     |
+| K2          | 30 %    | 300      | `01 2C`     |
+| K3          | 60 %    | 600      | `02 58`     |
+| K4          | 100 %   | 1000     | `03 E8`     |
+
+**Frame body** (between CRC1 and CRC2):
+```
+50 03 00 05 0d 00 ff <hi> <lo> <chk>
+```
+
+**CHK formula** — additive 8-bit, covers body excluding the `0x03` auth byte:
+```python
+chk = (0x50 + 0x05 + 0x0D + 0x00 + 0xFF + hi + lo) & 0xFF
+```
+
+**Usage:**
+```python
+from steca_setpoint import build_setpoint, build_setpoint_percent, EM_LEVELS
+
+frame = build_setpoint(300)                  # 30 %
+frame = build_setpoint_percent(60.0)         # 60 %
+frame = build_setpoint(EM_LEVELS["K2"] * 10) # K2 = 30 % → 300 ‰
+```
+
+**Operational notes:**
+- **Do not send while a physical SEM is connected to address `0x01`** — two-master collision on the RS485 bus; frames will corrupt each other.
+- The inverter discards the setpoint after a **timeout** (safe-state fallback, typically a few seconds). The caller must **repeat the frame periodically** to maintain the setpoint. A periodic sender loop is implemented separately.
+
 ---
 
 ## Data Encoding
@@ -252,7 +289,7 @@ SG_TOTAL_YIELD   = bytes.fromhex("02010010017bb564030001f146cc7903")
 
 ---
 
-## getStecaGridData.py
+## StecaGridController.py
 Reads/writes inverter data via RS485. All frames synthesized from `steca_crc.py`.
 
 ### Install
@@ -262,7 +299,7 @@ pip3 install pyserial
 
 ### Usage
 ```
-usage: getStecaGridData.py [-h] [-v] [-u] [-s SERIAL] [--id ID]
+usage: StecaGridController.py [-h] [-v] [-u] [-s SERIAL] [--id ID]
                            [-np] [-pp] [-pv] [-pc] [-ap] [-gm] [-el]
                            [-dy] [-ty] [-ti] [-sn] [-ve]
                            [--bootup-timestamp]
@@ -309,6 +346,11 @@ Write / control:
   --set-power-limit WATTS
       Read EnergyManager config from SEM (0x65), set DeratingMode=PowerLimit
       and DeratingPowerLimitW=WATTS, write back. Requires SEM connected.
+  --setpoint PERMILLE
+      Send active-power setpoint in permille (0..1000) directly to inverter.
+      WARNING: do not use with physical SEM on bus; repeat periodically.
+  --setpoint-percent PERCENT
+      Like --setpoint but in percent (0.0..100.0, 0.1 % resolution).
 ```
 
 ### Write ACK response codes
@@ -327,33 +369,33 @@ All write operations (`0x50`/`0x60`) return a status byte decoded as:
 
 ### Examples
 ```bash
-$ python3 getStecaGridData.py -ty -u
+$ python3 StecaGridController.py -ty -u
 52978840.0 Wh
 
-$ python3 getStecaGridData.py --bootup-timestamp
+$ python3 StecaGridController.py --bootup-timestamp
 Boot time: 2026-05-13 05:30:12  (24048000 ms uptime)
 
-$ python3 getStecaGridData.py --sync-time
+$ python3 StecaGridController.py --sync-time
 Syncing inverter clock to 2026-05-14 21:30:00 (no DST correction needed)
 OK
 Inverter time: 2026-05-14 21:30:01
 
-$ python3 getStecaGridData.py --sync-time
+$ python3 StecaGridController.py --sync-time
 Syncing inverter clock to 2026-05-14 21:30:00 (DST active → converted to standard/winter time)
 OK
 Inverter time: 2026-05-14 21:30:01
 
-$ python3 getStecaGridData.py --sync-time --DST
+$ python3 StecaGridController.py --sync-time --DST
 Syncing inverter clock to 2026-05-14 22:30:00 (DST mode — using local/summer time)
 OK
 Inverter time: 2026-05-14 22:30:01
 
-$ python3 getStecaGridData.py --set-time "2026-05-14 21:30:00"
+$ python3 StecaGridController.py --set-time "2026-05-14 21:30:00"
 Setting inverter time to 2026-05-14 21:30:00  (standard/winter time)
 OK
 Inverter time: 2026-05-14 21:30:01
 
-$ python3 getStecaGridData.py --10min-history
+$ python3 StecaGridController.py --10min-history
 10-min history: 2026-05-14  (today)
 ──────────────────────────────────
   06:20         6 Wh
@@ -363,7 +405,7 @@ $ python3 getStecaGridData.py --10min-history
 ──────────────────────────────────
   Total:    8,169 Wh
 
-$ python3 getStecaGridData.py --daily-history
+$ python3 StecaGridController.py --daily-history
 Daily history: May 2026
 ──────────────────────────
   2026-05-01    14,700 Wh
@@ -372,7 +414,7 @@ Daily history: May 2026
 ──────────────────────────
   Total:       193,270 Wh
 
-$ python3 getStecaGridData.py --monthly-history
+$ python3 StecaGridController.py --monthly-history
 Monthly history: 2026
 ─────────────────────────
   Jan      78,610 Wh
@@ -381,7 +423,7 @@ Monthly history: 2026
 ─────────────────────────
   Total    563,860 Wh
 
-$ python3 getStecaGridData.py --yearly-history
+$ python3 StecaGridController.py --yearly-history
 Yearly history
 ──────────────────────
   2014    9,500,000 Wh
@@ -391,12 +433,12 @@ Yearly history
 ──────────────────────
   Total  154,132,300 Wh
 
-$ python3 getStecaGridData.py --set-power-limit 2000
+$ python3 StecaGridController.py --set-power-limit 2000
 Reading EnergyManager config from SEM (0x65)...
 Writing power limit 2000 W to SEM...
 OK
 
-$ python3 getStecaGridData.py --discover --full-scan
+$ python3 StecaGridController.py --discover --full-scan
 StecaGrid RS485 Bus Discovery
   Scanning: 101 IDs (0x01..0x65)
   0x01  ✓ found  Serial: XXXXXXXXXXXXXXXXXXXX

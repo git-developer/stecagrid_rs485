@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-getStecaGridData.py — Read/write data via RS485 from StecaGrid 3600
+StecaGridController.py — Read/write data via RS485 from StecaGrid 3600
 
 CRC1 and CRC2 computed by steca_crc.py (nibble-table algorithms).
 Use --discover / --full-scan to find inverters, then query by --id.
@@ -13,6 +13,7 @@ import datetime
 import time
 
 from steca_crc import build_frame
+from steca_setpoint import build_setpoint, build_setpoint_percent, EM_LEVELS
 
 DEBUG = False
 
@@ -661,6 +662,15 @@ if __name__ == "__main__":
     parser.add_argument('--set-power-limit', type=int, metavar='WATTS',
                         help='Set inverter power limit via SEM EnergyManager config '
                              '(reads current config, sets DeratingMode=PowerLimit, writes back)')
+    # Active-power setpoint (EMLiveMeas)
+    _em_lvl_help = ", ".join(f"{k}={v}%" for k, v in EM_LEVELS.items())
+    parser.add_argument('--setpoint', type=int, metavar='PERMILLE',
+                        help=f'Active-power setpoint in permille 0..1000 '
+                             f'(EM relay levels: {_em_lvl_help} → ×10). '
+                             f'WARNING: do not use with physical SEM on bus.')
+    parser.add_argument('--setpoint-percent', type=float, metavar='PERCENT',
+                        help='Active-power setpoint in percent 0.0..100.0 (0.1 %% resolution). '
+                             'WARNING: do not use with physical SEM on bus.')
 
     args  = parser.parse_args()
     DEBUG = args.verbose
@@ -704,6 +714,20 @@ if __name__ == "__main__":
         write_req = build_write(SEM_ADDR, 0x0a, 0x60, bytes(config))
         port.reset_input_buffer()
         port.write(write_req)
+        _print_write_response(read_complete_frame(port, timeout_s=3.0))
+        port.close()
+        raise SystemExit(0)
+
+    if args.setpoint is not None or args.setpoint_percent is not None:
+        if args.setpoint is not None:
+            frame = build_setpoint(args.setpoint, to=inv_id)
+            label = f"{args.setpoint} ‰  ({args.setpoint / 10:.1f} %)"
+        else:
+            frame = build_setpoint_percent(args.setpoint_percent, to=inv_id)
+            label = f"{args.setpoint_percent:.1f} %  ({round(args.setpoint_percent * 10)} ‰)"
+        print(f"Setting active-power setpoint: {label}")
+        port.reset_input_buffer()
+        port.write(frame)
         _print_write_response(read_complete_frame(port, timeout_s=3.0))
         port.close()
         raise SystemExit(0)
