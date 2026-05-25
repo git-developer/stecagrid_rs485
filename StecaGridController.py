@@ -660,7 +660,7 @@ if __name__ == "__main__":
                              'If the system is in summer time (DST), subtracts 1 h '
                              'before writing — the Steca has no DST support.')
     # Active-power setpoint (EMLiveMeas)
-    _em_lvl_help = ", ".join(f"{k}={v}%" for k, v in EM_LEVELS.items())
+    _em_lvl_help = ", ".join(f"{k}={v}%%" for k, v in EM_LEVELS.items())
     parser.add_argument('--setpoint', type=int, metavar='PERMILLE',
                         help=f'Active-power setpoint in permille 0..1000 '
                              f'(EM relay levels: {_em_lvl_help} → ×10). '
