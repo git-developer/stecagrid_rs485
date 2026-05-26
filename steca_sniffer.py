@@ -1,22 +1,16 @@
 #!/usr/bin/env python3
 """
 steca_sniffer.py — Passive RS485 bus sniffer for StecaGrid 3600
-Threaded UART reader + CRC2 verification + event log decoder
+Threaded UART reader + CRC verification (nibble-table) + event log decoder
 
-CRC1: poly=0x39, init=0xAA, refin=True, refout=True, covers frame[0:6] ✓
-CRC2: GF(2) linear model — fully solved:
-  - Ping  (cmd=0x20, 12B):             100% verified, SEM=0xc9 + 0x7b
-  - Req16 (cmd=0x40/0x64/0x68, 16B):  100% verified, SEM=0xc9 + 0x7b
-    · cmd=0x64 base: T_REF=0x05, CRC2_REF=0x8ba1
-    · cmd=0x40 offset: XOR 0x572c
-    · cmd=0x68 offset: XOR 0xeef5  (derived from 3 captured frames)
-    · SEM=0x7b offset: XOR 0xb1e5 (req16) / XOR 0xb6db (ping)
+CRC1: CRC-8 nibble-table, init=0x55, covers frame[0:6]
+CRC2: CRC-16 nibble-table, init=0x5555, covers frame[:-3] + ETX — all frame types ✓
 
 Usage:
   python3 steca_sniffer.py --port /dev/ttyUSB0
   python3 steca_sniffer.py --port /dev/ttyUSB0 --verbose
 
-Install: pip3 install pyserial crcmod
+Install: pip3 install pyserial
 """
 
 import serial
@@ -29,85 +23,60 @@ import threading
 import queue
 import time
 
+from steca_crc import crc1 as _crc1, crc2 as _crc2
+
 SERIAL_BAUDRATE = 38400
 SERIAL_TIMEOUT  = 0.02   # short — thread reads continuously
 LOG_FILE        = "steca_sniffer.log"
 DEBUG_DROPS     = False
 
-SEM_IDS = {0x7b: "SEM-7b", 0xc9: "StecaUser-4.4"}
+SEM_IDS     = {0x7b: "SEM-7b", 0xc9: "StecaUser-4.4"}
 ID_INVERTER = 0x01
+SEM_ADDR    = 0x65   # RS485 address of the StecaGrid SEM energy manager
 
-TOPIC_NAMES = {
-    0x05: "Time",         0x08: "Mystery_08",   0x09: "Serial",
-    0x1d: "NominalPower", 0x22: "PanelPower",   0x23: "PanelVoltage",
-    0x24: "PanelCurrent", 0x29: "ACPower",       0x32: "Topic_32",
-    0x3c: "DailyYield",   0x51: "GridMeas",      0x52: "ENS_52",
-    0x53: "ENS_53",       0x5a: "EventLog_p1",   0x5b: "EventLog_p2",
-    0xf1: "TotalYield",
+_RS485_STATUS = {
+    0:  "Ok",                  1:  "ServiceNotSupported",
+    2:  "RequestOutOfRange",   3:  "ReadAddressOutOfRange",
+    4:  "ReadSizeOutOfRange",  5:  "WriteAddressOutOfRange",
+    6:  "WriteSizeOutOfRange", 8:  "NoCorrectRequest",
+    9:  "Busy",                10: "ReceivedDataInvalid",
+    11: "Timeout",             12: "ReadDataInvalid",
+    15: "NoResponse",          16: "Error",
 }
 
-# ── CRC1 ─────────────────────────────────────────────────────────────────────
-try:
-    import crcmod
-    _crc1_fn = crcmod.mkCrcFun(0x139, initCrc=0xAA, rev=True, xorOut=0x00)
-    def calc_crc1(frame: bytes) -> int:
-        return _crc1_fn(frame[0:6])
-except ImportError:
-    def calc_crc1(frame: bytes) -> int:
-        poly, crc = 0x39, 0xAA
-        for byte in frame[0:6]:
-            byte = int(f'{byte:08b}'[::-1], 2)
-            crc ^= byte
-            for _ in range(8):
-                crc = ((crc << 1) ^ poly) & 0xFF if crc & 0x80 else (crc << 1) & 0xFF
-        return int(f'{crc:08b}'[::-1], 2)
+_10MIN_HIST_TOPICS = frozenset(
+    (0x7b, 0x75, 0x6f, 0x69, 0x63, 0x5d, 0x57, *range(0x93, 0x7b, -1)))
+_ALL_HIST_TOPICS   = _10MIN_HIST_TOPICS | frozenset(
+    (0xbf, 0xbd, 0xbb, 0xb9, 0xb7, 0xb5, 0xb3,
+     0xb1, 0xaf, 0xad, 0xab, 0xa9, 0xa8)) | frozenset(range(0xe0, 0xcc, -1)) | {0xef}
 
-# ── CRC2 GF(2) linear model ───────────────────────────────────────────────────
-_M_PING      = [0x39b2, 0x7364, 0xe6c8, 0x78cd, 0xf19a, 0x5669, 0xacd2, 0x0000]
-_BASE_PING   = 0xf6e5
-_OFF_PING_7b = 0xb6db
+TOPIC_NAMES = {
+    # Inverter topics
+    0x05: "Time",             0x08: "BootupTimestamp",  0x09: "SerialNumber",
+    0x1d: "NominalPower",     0x22: "PanelPower",       0x23: "PanelVoltage",
+    0x24: "PanelCurrent",     0x29: "ACPower",           0x32: "CountryCode",
+    0x33: "CountryCodeList",  0x3c: "DailyYield",        0x51: "GridMeas_ENS1",
+    0x52: "GridMeas_L2",      0x53: "GridMeas_L3",       0x5a: "EventLog_p1",
+    0x5b: "EventLog_p2",      0xef: "YearlyHistory",     0xf1: "TotalYield",
+    # SEM topics
+    0x0a: "EMConfig",         0x0b: "RelaisHistory",     0x0d: "EMLiveMeas",
+    # Historical yield — 10-min curves (31), daily (13), monthly (20)
+    **{t: f"10minHistory[{i}]"   for i, t in enumerate(
+        (0x7b, 0x75, 0x6f, 0x69, 0x63, 0x5d, 0x57, *range(0x93, 0x7b, -1)))},
+    **{t: f"DailyHistory[{i}]"   for i, t in enumerate(
+        (0xbf, 0xbd, 0xbb, 0xb9, 0xb7, 0xb5, 0xb3,
+         0xb1, 0xaf, 0xad, 0xab, 0xa9, 0xa8))},
+    **{t: f"MonthlyHistory[{i}]" for i, t in enumerate(range(0xe0, 0xcc, -1))},
+}
 
-_T_REF   = 0x05
-_C_REF   = 0x8ba1
-_M_REQ16 = [
-    0x87c7, 0x72a3, 0x2d36, 0x5a6c, 0xb4d8, 0xdced, 0x0c87, 0x190e,
-    0x0000, 0x0000, 0xc870, 0x25bd, 0x4b7a, 0x96f4, 0x98b5, 0x8437,
-]
-_OFF_40 = 0x572c
-_OFF_68 = 0xeef5  # verified: 3/3 captured frames (topics 0x09, 0x5a, 0x5b)
-_OFF_7b = 0xb1e5
-
-def calc_crc2_ping(to_id: int, sem_id: int):
-    crc2 = _BASE_PING
-    for bit in range(8):
-        if to_id & (1 << bit): crc2 ^= _M_PING[bit]
-    if   sem_id == 0x7b: crc2 ^= _OFF_PING_7b
-    elif sem_id != 0xc9: return None
-    return crc2
-
-def calc_crc2_req16(topic: int, cmd: int, sem_id: int):
-    chk_ref = (_T_REF + 0x55) & 0xFF
-    chk     = (topic  + 0x55) & 0xFF
-    crc2    = _C_REF
-    for bit in range(8):
-        if ((topic ^ _T_REF) >> bit) & 1: crc2 ^= _M_REQ16[bit]
-        if ((chk ^ chk_ref) >> bit) & 1:  crc2 ^= _M_REQ16[8 + bit]
-    if cmd == 0x40: crc2 ^= _OFF_40
-    if cmd == 0x68: crc2 ^= _OFF_68
-    if   sem_id == 0x7b: crc2 ^= _OFF_7b
-    elif sem_id != 0xc9: return None
-    return crc2
+# ── CRC helpers ───────────────────────────────────────────────────────────────
+def calc_crc1(frame: bytes) -> int:
+    return _crc1(frame)
 
 def verify_crc2(frame: bytes):
-    length = (frame[2] << 8) | frame[3]
-    to_id  = frame[4];  sem_id = frame[5]
-    cmd    = frame[7]   if length > 7  else None
-    topic  = frame[11]  if length >= 12 else None
-    if length == 12 and cmd == 0x20:
-        return calc_crc2_ping(to_id, sem_id), "ping"
-    if length == 16 and cmd in (0x40, 0x64, 0x68) and to_id == ID_INVERTER and topic is not None:
-        return calc_crc2_req16(topic, cmd, sem_id), f"req16/{cmd:02x}"
-    return None, "?"
+    """Verify CRC2 for any frame type using the nibble-table CRC-16."""
+    expected = _crc2(frame[:-3])
+    return expected, "nibble_crc16"
 
 # ── Value decoders ────────────────────────────────────────────────────────────
 def _steca_float(b):
@@ -202,11 +171,14 @@ def decode_frame(frame: bytes, verbose: bool) -> dict:
     exp_crc2, crc2_model = verify_crc2(frame)
     crc2_ok = (exp_crc2 == crc2) if exp_crc2 is not None else None
 
-    sem_from = SEM_IDS.get(from_id);  sem_to = SEM_IDS.get(to_id)
-    if   sem_from and to_id == ID_INVERTER:      direction = "REQUEST"
-    elif sem_to   and from_id == ID_INVERTER:    direction = "RESPONSE"
-    elif sem_from and to_id != ID_INVERTER:      direction = f"PING→0x{to_id:02x}"
-    else:                                         direction = f"UNKNOWN(from=0x{from_id:02x},to=0x{to_id:02x})"
+    sem_from = SEM_IDS.get(from_id)
+    sem_to   = SEM_IDS.get(to_id)
+    if   sem_from and to_id == ID_INVERTER:  direction = "REQUEST"
+    elif sem_to   and from_id == ID_INVERTER: direction = "RESPONSE"
+    elif sem_from and to_id == SEM_ADDR:     direction = "→SEM"
+    elif from_id  == SEM_ADDR and sem_to:    direction = "←SEM"
+    elif sem_from:                           direction = f"PING→0x{to_id:02x}"
+    else:                                    direction = f"UNKNOWN(from=0x{from_id:02x},to=0x{to_id:02x})"
 
     cmd        = payload[0] if payload else None
     topic_byte = payload[4] if len(payload) >= 5 else None
@@ -217,22 +189,81 @@ def decode_frame(frame: bytes, verbose: bool) -> dict:
     try:
         if cmd == 0x20:
             decoded = "ping"
-        elif cmd in (0x41,0x65) and topic_byte == 0xf1 and len(payload) >= 9:
+        elif cmd in (0x41, 0x65) and topic_byte == 0xf1 and len(payload) >= 9:
             v, u = _total_yield(payload[5:9]);   decoded = f"{v:.2f} {u}"
         elif cmd == 0x41 and topic_byte == 0x3c and len(payload) >= 9:
             v, u = _steca_float(payload[5:9]);   decoded = f"{v:.2f} {u}"
-        elif cmd in (0x41,0x65) and topic_byte in (0x29,0x22,0x23,0x24,0x1d) and len(payload) >= 9:
+        elif cmd in (0x41, 0x65) and topic_byte in (0x29, 0x22, 0x23, 0x24, 0x1d) and len(payload) >= 9:
             v, u = _steca_float(payload[5:9]);   decoded = f"{v:.2f} {u}"
         elif cmd == 0x65 and topic_byte == 0x05 and len(payload) >= 11:
             p = payload[5:]
             decoded = str(datetime.datetime(2000+p[0], p[1], p[2], p[3], p[4], p[5]))
+        elif cmd == 0x65 and topic_byte == 0x08 and len(payload) >= 9:
+            import datetime as _dt
+            ms = struct.unpack('>I', payload[5:9])[0]
+            boot = _dt.datetime.now() - _dt.timedelta(milliseconds=ms)
+            decoded = f"boot={boot.strftime('%Y-%m-%d %H:%M:%S')} ({ms} ms uptime)"
         elif cmd == 0x65 and topic_byte == 0x09:
             decoded = payload[5:].rstrip(b'\x00\x9f').decode('latin-1', errors='replace')
+        elif cmd == 0x65 and topic_byte == 0x0a and len(payload) >= 49:
+            # EnergyManager config summary
+            d = payload[5:]
+            mode = d[3] if len(d) > 3 else 0
+            mode_name = {0:"Off", 1:"RippleCtrl", 2:"PowerLimit", 3:"EasyBox"}.get(mode, "?")
+            limit_w   = struct.unpack('>I', d[40:44])[0] if len(d) >= 44 else 0
+            nominal_w = struct.unpack('>I', d[36:40])[0] if len(d) >= 40 else 0
+            decoded = f"EMConfig mode={mode_name}({mode}) limit={limit_w}W nominal={nominal_w}W"
+        elif cmd in (0x51, 0x61) and len(payload) >= 5:
+            # WriteDataById ACK (0x51) / DownloadById ACK (0x61)
+            status    = payload[1]
+            name      = _RS485_STATUS.get(status, f"0x{status:02x}")
+            ack_label = "DownloadACK" if cmd == 0x61 else "WriteACK"
+            ok_mark   = "✓" if status == 0 else "✗"
+            decoded   = f"{ack_label} topic=0x{topic_byte:02x} [{ok_mark}] {name}(0x{status:02x})"
+        elif cmd == 0x65 and topic_byte in _ALL_HIST_TOPICS:
+            raw = payload[5:-1]
+            n   = (len(raw) // 4) * 4
+            is_curve = topic_byte in _10MIN_HIST_TOPICS
+            vals = []
+            for i in range(0, n, 4):
+                f, = struct.unpack_from('<f', raw, i)
+                vals.append(int(round(f * 6 if is_curve else f)))
+            nonzero = [v for v in vals if v]
+            total   = sum(nonzero)
+            peak    = max(nonzero) if nonzero else 0
+            decoded = (f"{len(nonzero)} non-zero slots  total={total:,} Wh  peak={peak:,} Wh"
+                       f"  ({len(vals)} slots total)")
         elif cmd == 0x69 and topic_byte in (0x5a, 0x5b):
             total_ev, events = decode_event_log(payload)
             page = "p1" if topic_byte == 0x5a else "p2"
             decoded   = f"event_log({page}): {total_ev} total, {len(events)} entries"
             event_log = (total_ev, events)
+        elif cmd == 0x50 and len(payload) >= 6:
+            # WriteDataById — show ID and raw data
+            id_b = payload[4]
+            data = payload[5:-1]
+            decoded = f"Write(0x50) ID=0x{id_b:02x} data={fmt_hex(data[:16])}{'…' if len(data)>16 else ''}"
+        elif cmd == 0x60 and len(payload) >= 6:
+            # DownloadById
+            id_b = payload[4]
+            data = payload[5:-1]
+            if id_b == 0x05 and len(data) >= 6:
+                try:
+                    dt = datetime.datetime(2000+data[0], data[1], data[2],
+                                           data[3], data[4], data[5])
+                    decoded = f"SetTime {dt}"
+                except Exception:
+                    decoded = f"Download(0x60) ID=0x05 data={fmt_hex(data)}"
+            elif id_b == 0x0a and to_id == SEM_ADDR and len(data) >= 44:
+                mode = data[3]
+                mode_name = {0:"Off",1:"RippleCtrl",2:"PowerLimit",3:"EasyBox"}.get(mode,"?")
+                limit_w   = struct.unpack('>I', bytes(data[40:44]))[0]
+                nominal_w = struct.unpack('>I', bytes(data[36:40]))[0]
+                decoded = (f"SetEMConfig mode={mode_name}({mode}) "
+                           f"limit={limit_w}W nominal={nominal_w}W")
+            else:
+                decoded = (f"Download(0x60) ID=0x{id_b:02x} "
+                           f"data={fmt_hex(bytes(data[:16]))}{'…' if len(data)>16 else ''}")
     except Exception as e:
         decoded = f"err:{e}"
 
@@ -329,7 +360,7 @@ def main():
     DEBUG_DROPS = args.verbose
 
     print(f"Steca RS485 Sniffer  port={args.port}  baud={SERIAL_BAUDRATE}")
-    print(f"Threaded reader  |  CRC2 model: ping + req16(0x40/0x64/0x68)  |  EventLog decoder: p1+p2")
+    print(f"Threaded reader  |  CRC1+CRC2: nibble-table (all frame types)  |  EventLog decoder: p1+p2")
     if not args.no_log: print(f"Log → {args.log}")
     print("Ctrl+C to stop.\n")
 

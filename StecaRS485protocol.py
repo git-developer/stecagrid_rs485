@@ -1,3 +1,10 @@
+#!/usr/bin/env python3
+"""
+StecaRS485protocol.py — very early and poor implementation of my attempt to mimic the RS485 protocol for StecaGrid 3600
+
+For refrence only, don't use.
+"""
+
 import serial
 import time
 import binascii
