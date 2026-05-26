@@ -3,8 +3,7 @@ Tools to read out and decode data from a StecaGrid 3600 solar inverter via RS485
 Developed and tested against firmware from 2013 (see [firmware versions](#based-on-versions)).
 
 ## The Protocol
-A proprietary request/response protocol over RS485, used by the StecaGrid SEM energy manager
-to communicate with StecaGrid inverters. Newer inverter models have an XML/HTTP API instead.
+A proprietary request/response protocol over RS485. Some requests are initiated by the Steca User Software, others are used by the StecaGrid SEM to communicate with StecaGrid inverters. Newer inverter models have an XML/HTTP API instead.
 
 ### Serial Parameters
 | Parameter | Value |
@@ -56,10 +55,6 @@ LEN = total frame length including STX (0x02) and ETX (0x03)
 | `0x64`  | UploadById            | `0x65`   |
 | `0x68`  | UploadInternById      | `0x69`   |
 | `0x70`  | BootloaderConnect     | `0x71`   |
-
-### Authorization Levels
-`0`=User, `1`=Service, `2`=Development, `3`=Administrator.
-The software operates at Administrator level by default.
 
 ---
 
@@ -119,38 +114,9 @@ Index 0 = most recent period, index N = N periods ago.
 | `0x60` | `0x05` | `[YY MM DD HH MM SS]`    | Set time                   |
 | `0x60` | `0xf1` | `float32_LE × 1000`      | Set total yield            |
 
-### To SEM (TO=`0x65`)
-| Cmd    | Topic  | Data                | Effect                  |
-|--------|--------|---------------------|-------------------------|
-| `0x60` | `0x0a` | 87-byte EM payload  | Set EnergyManager config |
+### Inverter output capacity reduction
 
-### EnergyManager payload structure (87 bytes, big-endian)
-```
-[0]     uint8:  payload_version (= 0)
-[1-2]   int16:  S0PulsesPerkWh
-[3]     uint8:  DeratingMode  (0=Off, 1=RippleControl, 2=PowerLimit, 3=EasyBox)
-[4-35]  16×int16: DeratingPatterns[16]  (-1 = disabled)
-[36-39] uint32: NominalPowerW
-[40-43] uint32: DeratingPowerLimitW       ← power limit in watts
-[44-45] uint16: PID Kp
-[46-47] uint16: PID Ki
-[48-49] uint16: PID Kd
-[50-51] uint16: PeriodeMin_s
-[52-53] uint16: PeriodeMax_s
-[54-55] uint16: Limit_Permill
-[56]    uint8:  RelaisMode  (0=Off, 1=InputPattern, 2=MinPower, 3=MinPower_SmartGrid)
-[57-58] uint16: RelaisPatterns bitfield
-[59-62] uint32: Activation.ThresholdPower_W
-[63-66] uint32: Deactivation.ThresholdPower_W
-[67-68] uint16: Activation.ThresholdDerating_Permille
-[69-70] uint16: Deactivation.ThresholdDerating_Permille
-[71-74] uint32: Activation.Latency_s
-[75-78] uint32: Deactivation.Latency_s
-[79-82] uint32: Activation.HoldTime_s
-[83-86] uint32: Deactivation.HoldTime_s
-```
-
-### Active-power setpoint (EMLiveMeas)
+Limits the inverter output relative to its nominal power (e.g. 3600 Watts).
 
 Write(0x50) on Topic `0x0d`, TO=`0x01` (inverter), FROM=`0x7b` (SEM sender).
 Verified against live hardware across all four relay levels.
@@ -184,8 +150,8 @@ frame = build_setpoint(EM_LEVELS["K2"] * 10) # K2 = 30 % → 300 ‰
 ```
 
 **Operational notes:**
-- **Do not send while a physical SEM is connected to address `0x01`** — two-master collision on the RS485 bus; frames will corrupt each other.
-- The inverter discards the setpoint after a **timeout** (safe-state fallback, typically a few seconds). The caller must **repeat the frame periodically** to maintain the setpoint. A periodic sender loop is implemented separately.
+- **Do not send while a physical SEM is connected** — there is a slight risk of collisions on RS485 bus as well as a bigger risk contradicting frequent communication by the SEM.
+- To keep the limit over a longer period, a caller might want to **repeat the frame periodically** to maintain the setpoint.
 
 ---
 
@@ -256,13 +222,13 @@ def build_frame(to: int, frm: int, payload: bytes) -> bytes:
     return body + bytes([c2 >> 8, c2 & 0xFF, 0x03])
 ```
 
-### CRC1 — **Fully solved** ✓
+### CRC1
 ```python
 crc1 = crc8_nibble(frame[0:6], init=0x55)
 ```
 Covers frame bytes `[0:6]` (STX through FROM). Verified against all known frames.
 
-### CRC2 — **Fully solved** ✓
+### CRC2
 ```python
 crc2 = crc16_nibble(frame[:-3] + b'\x03', init=0x5555)
 ```
@@ -365,8 +331,19 @@ All write operations (`0x50`/`0x60`) return a status byte decoded as:
 
 ### Examples
 ```bash
+$ python3 StecaGridController.py --nominal_power --unit
+3600.0 W
+
 $ python3 StecaGridController.py -ty -u
 52978840.0 Wh
+
+$ python3 StecaGridController.py --setpoint 300
+Setting active-power setpoint: 300 ‰  (30.0 %)
+OK
+
+$ python3  StecaGridController.py --setpoint 1000
+Setting active-power setpoint: 1000 ‰  (100.0 %)
+OK
 
 $ python3 StecaGridController.py --bootup-timestamp
 Boot time: 2026-05-13 05:30:12  (24048000 ms uptime)
@@ -468,11 +445,6 @@ python3 steca_sniffer.py --port /dev/ttyUSB0 --no-log
   Topic:   0x5a EventLog_p1
   CRC1:0x01[✓]  CRC2:0x0024[✓]  model=nibble_crc16
   → event_log(p1): 74 total, 20 entries
-
-[00:07:01] →SEM  TO=0x65 FROM=0x7b  LEN=103  SEM-7b
-  Topic:   0x0a EMConfig
-  CRC1:0xe3[✓]  CRC2:0x1a2b[✓]  model=nibble_crc16
-  → SetEMConfig mode=PowerLimit(2) limit=2000W nominal=3600W
 ```
 
 ---
@@ -501,15 +473,6 @@ ENS2 APP    39.0.0  11.07.2013_14:39:50
 ENS2 PAR    0.0.14  11.07.2013_14:40:03
 HMI / PU / ENS2 — Net11
 ```
-
----
-
-## Open Topics
-- **EnergyManager payload endianness**: assumed big-endian; unverified without a live SEM capture.
-- **Historical yield float encoding**: verified against live inverter (StecaGrid 3600):
-  DayCurve slots `× 6 → Wh`; DayValues / MonthValues / YearValues `round(f) → Wh`.
-  Leading all-zero 4-byte groups are padding and are skipped before decoding.
-- **SEM live measurements** (topic `0x0d`): structure unknown.
 
 ---
 
