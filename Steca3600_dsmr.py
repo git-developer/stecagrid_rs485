@@ -1,3 +1,11 @@
+#!/usr/bin/env python3
+"""
+Steca3600_dsmr.py — Read/write data via RS485 from StecaGrid 3600
+
+worked for me for a few years, but not actively maintained.
+consider mqtt instead.
+"""
+
 import sys
 import asyncio
 import argparse
