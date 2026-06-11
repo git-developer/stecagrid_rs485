@@ -1,6 +1,15 @@
 # StecaGrid 3600 MQTT Service configuration
 
 # ── MQTT broker ───────────────────────────────────────────────────────────────
+#
+# mqtt_broker_address – Hostname of the MQTT broker (required)
+# mqtt_broker_port    – Port of the MQTT broker (optional)
+# mqtt_username       – Username for MQTT login (optional)
+# mqtt_password       – Password for MQTT login (optional)
+# mqtt_tls            – <true> enables MQTT-over-TLS (MQTTS, Port 8883) (optional)
+# mqtt_tls_ca         – Path to a custom CA certificate file (optional)
+#                         If TLS is enabled without a custom CA,
+#                         system certificates (usually in /etc/ssl/certs) are used
 mqtt_broker_address: 'nas.ds18'
 mqtt_username: 'mqtt_user'
 mqtt_password: 'xyzxyz'

@@ -34,6 +34,7 @@ under  <ha_discovery_prefix>/sensor/  and  /number/  (retain=True).
 import argparse
 import json
 import re
+import ssl
 import threading
 import time
 
@@ -301,9 +302,20 @@ class StecaMqttService:
 
     # ── MQTT connect loop ─────────────────────────────────────────────────────
     def _connect_mqtt(self):
+        mqtt_default_port = 1883
+        if self._cfg.get("mqtt_tls", False) or "mqtt_tls_ca" in self._cfg:
+            mqtt_default_port = 8883
+            if "mqtt_tls_ca" in self._cfg:
+                self._mqtt.tls_set(self._cfg["mqtt_tls_ca"])
+            else:
+                ssl_context = ssl.create_default_context(purpose=ssl.Purpose.SERVER_AUTH)
+                self._mqtt.tls_set_context(ssl_context)
+            self._mqtt.tls_insecure_set(False)
+        mqtt_broker_port = self._cfg.get("mqtt_broker_port", mqtt_default_port)
+
         while True:
             try:
-                self._mqtt.connect(self._cfg["mqtt_broker_address"])
+                self._mqtt.connect(self._cfg["mqtt_broker_address"], mqtt_broker_port)
                 break
             except Exception as e:
                 print(f"Can't connect to MQTT broker "
